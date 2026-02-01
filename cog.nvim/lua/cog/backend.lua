@@ -12,9 +12,14 @@ local function ensure_started()
   local config = require("cog.config").get()
   local bin_path = config.backend.bin_path or "cog-agent"
 
+  -- Check if binary exists
+  if vim.fn.executable(bin_path) == 0 then
+    error("cog-agent not found or not executable: " .. bin_path)
+  end
+
   local chan = vim.fn.jobstart({ bin_path }, { rpc = true })
   if chan <= 0 then
-    error("Failed to start cog-agent")
+    error("Failed to start cog-agent (jobstart returned: " .. tostring(chan) .. ")")
   end
 
   state.chan = chan
@@ -34,7 +39,11 @@ end
 
 function M.request(method, params)
   ensure_started()
-  return vim.rpcrequest(state.chan, method, params or vim.empty_dict())
+  local ok, result = pcall(vim.rpcrequest, state.chan, method, params or vim.empty_dict())
+  if not ok then
+    error(result)
+  end
+  return result
 end
 
 function M.notify(method, params)
