@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 #[derive(Debug)]
@@ -56,7 +56,7 @@ impl AcpClient {
         let pending_clone = pending.clone();
 
         // Capture stderr to report errors
-        let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel::<String>();
+        let (stderr_tx, stderr_rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -152,9 +152,10 @@ impl AcpClient {
         self.write_line(msg).await?;
 
         // Use std::thread based timeout since tokio::time doesn't work under nvim
+        // 30 second timeout to handle slow initial connections
         let (timeout_tx, timeout_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_secs(30));
             let _ = timeout_tx.send(());
         });
 
@@ -176,7 +177,7 @@ impl AcpClient {
                             // Check timeout
                             if timeout_rx.try_recv().is_ok() {
                                 let _ = self.pending.lock().unwrap().remove(&msgid);
-                                return Err(anyhow!("request timed out after 5 seconds - the ACP process may have failed to start or exited unexpectedly"));
+                                return Err(anyhow!("request timed out after 30 seconds - the ACP process may have failed to start or exited unexpectedly"));
                             }
                         }
                     }

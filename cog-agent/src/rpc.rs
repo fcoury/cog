@@ -104,14 +104,6 @@ pub fn encode_response(msgid: u64, error: Option<Value>, result: Option<Value>) 
     ])
 }
 
-pub fn encode_notification(method: &str, params: Vec<Value>) -> Value {
-    Value::Array(vec![
-        Value::from(2),
-        Value::from(method.to_string()),
-        Value::Array(params),
-    ])
-}
-
 pub fn start_reader_thread(tx: mpsc::UnboundedSender<Value>) {
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -182,11 +174,6 @@ impl RpcClient {
         let msg = encode_request(msgid, method, params);
         let _ = self.tx.send(msg);
         rx
-    }
-
-    pub fn notify(&self, method: &str, params: Vec<Value>) {
-        let msg = encode_notification(method, params);
-        let _ = self.tx.send(msg);
     }
 }
 

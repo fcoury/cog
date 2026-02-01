@@ -311,15 +311,30 @@ async fn handle_prompt(state: Arc<AppState>, params: Vec<Value>) -> Result<Value
         }
     ]);
 
-    let _ = client
-        .request(
-            "session/prompt",
-            json!({
-                "sessionId": params.session_id,
-                "prompt": prompt,
-            }),
-        )
-        .await?;
+    // Fire-and-forget the request so Neovim isn't blocked during streaming updates.
+    // If the request fails, report via CogError so the UI can surface it.
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let result = client
+            .request(
+                "session/prompt",
+                json!({
+                    "sessionId": params.session_id,
+                    "prompt": prompt,
+                }),
+            )
+            .await;
+        if let Err(err) = result {
+            state_clone
+                .notify_lua(
+                    "CogError",
+                    json!({
+                        "message": format!("prompt request failed: {err}"),
+                    }),
+                )
+                .await;
+        }
+    });
 
     Ok(Value::from(true))
 }
