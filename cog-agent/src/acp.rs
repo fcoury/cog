@@ -3,6 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -22,8 +23,8 @@ pub struct AcpClient {
 
 pub struct AcpConnection {
     pub client: AcpClient,
-    pub child: Child,
     pub inbound_rx: Option<mpsc::UnboundedReceiver<AcpInbound>>,
+    pub stderr_rx: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 impl AcpClient {
@@ -42,17 +43,29 @@ impl AcpClient {
         if !env.is_empty() {
             cmd.envs(env);
         }
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("missing stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("missing stdout"))?;
+        let stderr = child.stderr.take().ok_or_else(|| anyhow!("missing stderr"))?;
 
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<JsonValue>>>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let pending_clone = pending.clone();
 
+        // Capture stderr to report errors
+        let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                tracing::warn!("acp stderr: {line}");
+                let _ = stderr_tx.send(line);
+            }
+        });
+
+        // Read stdout and process messages
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -104,10 +117,18 @@ impl AcpClient {
             next_id: Arc::new(StdMutex::new(1)),
         };
 
+        // Check if child exits early (indicates startup error)
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Ok(Some(status)) = child.try_wait() {
+                tracing::error!("acp child exited early with status: {status}");
+            }
+        });
+
         Ok(AcpConnection {
             client,
-            child,
             inbound_rx: Some(inbound_rx),
+            stderr_rx: Some(stderr_rx),
         })
     }
 
@@ -119,7 +140,7 @@ impl AcpClient {
             id
         };
 
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(msgid, tx);
 
         let msg = serde_json::json!({
@@ -130,7 +151,43 @@ impl AcpClient {
         });
         self.write_line(msg).await?;
 
-        rx.await.map_err(|_| anyhow!("acp response dropped"))?
+        // Use std::thread based timeout since tokio::time doesn't work under nvim
+        let (timeout_tx, timeout_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = timeout_tx.send(());
+        });
+
+        // Race between the response and the timeout
+        let result = match rx.try_recv() {
+            Ok(val) => val,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                // Response not ready yet, wait for either response or timeout
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    
+                    // Check if response is ready
+                    match rx.try_recv() {
+                        Ok(val) => break val,
+                        Err(oneshot::error::TryRecvError::Closed) => {
+                            return Err(anyhow!("acp response channel closed - the ACP process may have exited"));
+                        }
+                        Err(oneshot::error::TryRecvError::Empty) => {
+                            // Check timeout
+                            if timeout_rx.try_recv().is_ok() {
+                                let _ = self.pending.lock().unwrap().remove(&msgid);
+                                return Err(anyhow!("request timed out after 5 seconds - the ACP process may have failed to start or exited unexpectedly"));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                return Err(anyhow!("acp response channel closed - the ACP process may have exited"));
+            }
+        };
+        
+        result
     }
 
     pub async fn notify(&self, method: &str, params: JsonValue) -> Result<()> {

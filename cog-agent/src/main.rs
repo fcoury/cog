@@ -56,6 +56,26 @@ struct FileWriteResponseParams {
     message: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ToolResponseParams {
+    request_id: u64,
+    ok: bool,
+    result: Option<JsonValue>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetModeParams {
+    session_id: String,
+    mode_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetModelParams {
+    session_id: String,
+    model_id: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     rpc: RpcClient,
@@ -63,6 +83,7 @@ struct AppState {
     pending_permission: Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>>,
     pending_read: Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>>,
     pending_write: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
+    pending_tool: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<JsonValue>>>>>,
 }
 
 impl AppState {
@@ -73,6 +94,7 @@ impl AppState {
             pending_permission: Arc::new(Mutex::new(HashMap::new())),
             pending_read: Arc::new(Mutex::new(HashMap::new())),
             pending_write: Arc::new(Mutex::new(HashMap::new())),
+            pending_tool: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -130,14 +152,7 @@ async fn main() -> Result<()> {
                     let result = handle_request(state_clone, method, params).await;
                     let response = match result {
                         Ok(val) => encode_response(msgid, None, Some(val)),
-                        Err(err) => encode_response(
-                            msgid,
-                            Some(Value::Map(vec![(
-                                Value::from("message"),
-                                Value::from(err.to_string()),
-                            )])),
-                            None,
-                        ),
+                        Err(err) => encode_response(msgid, Some(Value::from(err.to_string())), None),
                     };
                     let _ = tx.send(response);
                 });
@@ -149,6 +164,7 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_request(state: Arc<AppState>, method: String, params: Vec<Value>) -> Result<Value> {
+    tracing::info!("handle_request: method={}", method);
     match method.as_str() {
         "cog_connect" => handle_connect(state, params).await,
         "cog_disconnect" => handle_disconnect(state).await,
@@ -159,12 +175,18 @@ async fn handle_request(state: Arc<AppState>, method: String, params: Vec<Value>
         "cog_permission_respond" => handle_permission_response(state, params).await,
         "cog_file_read_response" => handle_file_read_response(state, params).await,
         "cog_file_write_response" => handle_file_write_response(state, params).await,
+        "cog_tool_response" => handle_tool_response(state, params).await,
+        "cog_set_mode" => handle_set_mode(state, params).await,
+        "cog_set_model" => handle_set_model(state, params).await,
         _ => Err(anyhow!("unknown method {method}")),
     }
 }
 
 async fn handle_connect(state: Arc<AppState>, params: Vec<Value>) -> Result<Value> {
+    tracing::info!("handle_connect called");
+    tracing::debug!("cog_connect params raw: {:?}", params);
     let params: ConnectParams = as_single_param(params)?;
+    tracing::info!("cog_connect command: {:?}", params.command);
     if params.command.is_empty() {
         return Err(anyhow!("command is required"));
     }
@@ -173,6 +195,7 @@ async fn handle_connect(state: Arc<AppState>, params: Vec<Value>) -> Result<Valu
     let mut connection = AcpClient::spawn(params.command, env, params.cwd).await?;
     let client = connection.client.clone();
     let inbound_rx = connection.inbound_rx.take();
+    let mut stderr_rx = connection.stderr_rx.take();
 
     let mut acp_lock = state.acp.lock().await;
     *acp_lock = Some(connection);
@@ -187,25 +210,60 @@ async fn handle_connect(state: Arc<AppState>, params: Vec<Value>) -> Result<Valu
         }
     });
 
+    // Spawn stderr collector
+    let stderr_handle = tokio::spawn(async move {
+        let mut stderr_lines = Vec::new();
+        if let Some(rx) = &mut stderr_rx {
+            while let Ok(line) = rx.try_recv() {
+                stderr_lines.push(line);
+            }
+        }
+        stderr_lines
+    });
+
     let protocol_version = params.protocol_version.unwrap_or_else(|| "1.0".to_string());
     let init_params = json!({
         "protocolVersion": protocol_version,
         "clientCapabilities": {
             "fs": { "readTextFile": true, "writeTextFile": true },
+            "extensions": {
+                "methods": [
+                    "_cog.nvim/grep",
+                    "_cog.nvim/apply_edits",
+                    "_cog.nvim/lsp/rename",
+                    "_cog.nvim/lsp/code_action"
+                ]
+            }
         },
         "clientInfo": { "name": "cog.nvim", "version": "0.1.0" }
     });
 
-    let init_resp = client.request("initialize", init_params).await?;
-
-    Ok(json_to_rmpv(&init_resp))
+    // Use timeout for initialize to detect early exit
+    tracing::info!("sending initialize request...");
+    let init_result = client.request("initialize", init_params).await;
+    tracing::info!("initialize result: {:?}", init_result);
+    
+    let stderr_lines = stderr_handle.await.unwrap_or_default();
+    
+    match init_result {
+        Ok(resp) => Ok(json_to_rmpv(&resp)),
+        Err(e) => {
+            let stderr_msg = if stderr_lines.is_empty() {
+                String::new()
+            } else {
+                format!("\nProcess stderr:\n{}", stderr_lines.join("\n"))
+            };
+            Err(anyhow!("initialize request failed: {}{}", e, stderr_msg))
+        }
+    }
 }
 
 async fn handle_disconnect(state: Arc<AppState>) -> Result<Value> {
     let mut lock = state.acp.lock().await;
-    if let Some(mut conn) = lock.take() {
+    if let Some(conn) = lock.take() {
         let _ = conn.client.notify("disconnect", JsonValue::Null).await;
-        let _ = conn.child.kill().await;
+        // Note: we don't have direct access to child process here anymore,
+        // but the client connection closing will signal shutdown
     }
     Ok(Value::from(true))
 }
@@ -218,6 +276,7 @@ async fn handle_session_new(state: Arc<AppState>, params: Vec<Value>) -> Result<
             "session/new",
             json!({
                 "cwd": params.cwd,
+                "mcpServers": [],
             }),
         )
         .await?;
@@ -305,6 +364,43 @@ async fn handle_file_write_response(state: Arc<AppState>, params: Vec<Value>) ->
             let _ = tx.send(Err(params.message.unwrap_or_else(|| "unknown error".into())));
         }
     }
+    Ok(Value::from(true))
+}
+
+async fn handle_tool_response(state: Arc<AppState>, params: Vec<Value>) -> Result<Value> {
+    let params: ToolResponseParams = as_single_param(params)?;
+    let mut pending = state.pending_tool.lock().await;
+    if let Some(tx) = pending.remove(&params.request_id) {
+        if params.ok {
+            let _ = tx.send(Ok(params.result.unwrap_or(JsonValue::Null)));
+        } else {
+            let _ = tx.send(Err(anyhow!(params.error.unwrap_or_else(|| "tool error".into()))));
+        }
+    }
+    Ok(Value::from(true))
+}
+
+async fn handle_set_mode(state: Arc<AppState>, params: Vec<Value>) -> Result<Value> {
+    let params: SetModeParams = as_single_param(params)?;
+    let client = get_client(&state).await?;
+    let _ = client
+        .request(
+            "session/set_mode",
+            json!({ "sessionId": params.session_id, "modeId": params.mode_id }),
+        )
+        .await?;
+    Ok(Value::from(true))
+}
+
+async fn handle_set_model(state: Arc<AppState>, params: Vec<Value>) -> Result<Value> {
+    let params: SetModelParams = as_single_param(params)?;
+    let client = get_client(&state).await?;
+    let _ = client
+        .request(
+            "session/set_model",
+            json!({ "sessionId": params.session_id, "modelId": params.model_id }),
+        )
+        .await?;
     Ok(Value::from(true))
 }
 
@@ -409,6 +505,23 @@ async fn handle_acp_inbound(
                                 })),
                             )
                             .await;
+                    }
+                    method_name if method_name.starts_with("_cog.nvim/") => {
+                        let (tx, rx) = oneshot::channel();
+                        state.pending_tool.lock().await.insert(id, tx);
+                        state
+                            .notify_lua(
+                                "CogToolRequest",
+                                json!({
+                                    "request_id": id,
+                                    "method": method_name,
+                                    "params": params,
+                                }),
+                            )
+                            .await;
+
+                        let result = rx.await.unwrap_or_else(|_| Err(anyhow!("tool failed")));
+                        let _ = client.respond(id, result).await;
                     }
                     _ => {
                         let _ = client
