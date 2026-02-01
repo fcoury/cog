@@ -114,7 +114,10 @@ function M.disconnect()
   if not state.connected then
     return
   end
-  backend.request("cog_disconnect", {})
+  -- Try to cleanly disconnect from ACP
+  pcall(backend.request, "cog_disconnect", {})
+  -- Stop the backend process
+  backend.stop()
   state.connected = false
   state.session_id = nil
   state.agent_info = nil
@@ -132,14 +135,37 @@ function M.prompt(text)
   ui.chat.begin_pending()
 
   vim.schedule(function()
-    local ok, err = pcall(backend.request, "cog_prompt", {
+    local ok, result = pcall(backend.request, "cog_prompt", {
       session_id = state.session_id,
       content = text,
     })
     if not ok then
+      -- If it's a timeout, try reconnecting and retrying once
+      local err_str = tostring(result)
+      if err_str:match("timed out") then
+        vim.notify("cog.nvim: First prompt timed out, reconnecting...", vim.log.levels.WARN)
+        -- Try to reconnect
+        state.connected = false
+        local reconnect_ok = pcall(M.connect)
+        if reconnect_ok and state.session_id then
+          -- Retry the prompt
+          local retry_ok, retry_result = pcall(backend.request, "cog_prompt", {
+            session_id = state.session_id,
+            content = text,
+          })
+          if retry_ok then
+            ui.chat.end_stream("assistant")
+            return
+          end
+          result = retry_result
+        end
+      end
       ui.chat.clear_pending()
-      ui.chat.append("system", "Prompt failed: " .. tostring(err))
+      ui.chat.append("system", "Prompt failed: " .. tostring(result))
+      ui.chat.end_stream("assistant")
+      return
     end
+    ui.chat.end_stream("assistant")
   end)
 end
 
@@ -164,6 +190,39 @@ function M.set_model(model_id)
   backend.request("cog_set_model", { session_id = state.session_id, model_id = model_id })
 end
 
+local function extract_text_from_content(content)
+  if type(content) == "string" then
+    return content
+  end
+  if type(content) ~= "table" then
+    return nil
+  end
+  if content.text then
+    return content.text
+  end
+  if content.content and type(content.content) == "table" and content.content.text then
+    return content.content.text
+  end
+  if content[1] ~= nil then
+    local parts = {}
+    for _, item in ipairs(content) do
+      if type(item) == "string" then
+        table.insert(parts, item)
+      elseif type(item) == "table" then
+        if item.text then
+          table.insert(parts, item.text)
+        elseif item.content and type(item.content) == "table" and item.content.text then
+          table.insert(parts, item.content.text)
+        end
+      end
+    end
+    if #parts > 0 then
+      return table.concat(parts, "")
+    end
+  end
+  return nil
+end
+
 local function extract_text_from_update(payload)
   if type(payload) ~= "table" then
     return tostring(payload)
@@ -174,7 +233,18 @@ local function extract_text_from_update(payload)
   end
 
   if payload.delta then
-    return payload.delta
+    if type(payload.delta) == "string" then
+      return payload.delta
+    end
+    if type(payload.delta) == "table" then
+      if payload.delta.text then
+        return payload.delta.text
+      end
+      local delta_content = extract_text_from_content(payload.delta.content)
+      if delta_content then
+        return delta_content
+      end
+    end
   end
 
   if payload.message then
@@ -182,25 +252,174 @@ local function extract_text_from_update(payload)
       if payload.message.text then
         return payload.message.text
       end
-      if payload.message.content then
-        return payload.message.content
+      local message_content = extract_text_from_content(payload.message.content)
+      if message_content then
+        return message_content
       end
     end
   end
 
   if payload.content then
-    if type(payload.content) == "string" then
-      return payload.content
-    end
-    if type(payload.content) == "table" and payload.content.text then
-      return payload.content.text
-    end
-    if type(payload.content) == "table" and payload.content[1] and payload.content[1].text then
-      return payload.content[1].text
+    local content_text = extract_text_from_content(payload.content)
+    if content_text then
+      return content_text
     end
   end
 
   return vim.inspect(payload)
+end
+
+local function normalize_update_type(update_type)
+  if not update_type then
+    return nil
+  end
+  if type(update_type) ~= "string" then
+    return tostring(update_type)
+  end
+  local normalized = update_type
+    :gsub("([a-z0-9])([A-Z])", "%1_%2")
+    :gsub("%-", "_")
+    :gsub("%s+", "_")
+    :lower()
+  return normalized
+end
+
+local function is_list(value)
+  if type(vim.islist) == "function" then
+    return vim.islist(value)
+  end
+  return vim.tbl_islist(value)
+end
+
+-- Extract readable text from a value, handling common structures
+local function extract_display_text(value, max_len)
+  if value == nil then
+    return nil
+  end
+  max_len = max_len or 500
+
+  if type(value) == "string" then
+    if #value > max_len then
+      return value:sub(1, max_len) .. "..."
+    end
+    return value
+  end
+
+  if type(value) ~= "table" then
+    return tostring(value)
+  end
+
+  -- Handle common output structures
+  -- rawOutput often has aggregated_output with the actual content
+  if value.aggregated_output then
+    local text = tostring(value.aggregated_output)
+    if #text > max_len then
+      return text:sub(1, max_len) .. "..."
+    end
+    return text
+  end
+
+  -- Handle output with text field
+  if value.text then
+    return tostring(value.text)
+  end
+
+  -- Handle output with content field
+  if value.content then
+    if type(value.content) == "string" then
+      return value.content
+    elseif type(value.content) == "table" and value.content.text then
+      return value.content.text
+    end
+  end
+
+  -- For locations, extract just the paths
+  if value[1] and value[1].path then
+    local paths = {}
+    for _, loc in ipairs(value) do
+      if loc.path then
+        table.insert(paths, loc.path)
+      end
+    end
+    return table.concat(paths, "\n")
+  end
+
+  -- For input with command, show the command
+  if value.command then
+    if type(value.command) == "table" then
+      return table.concat(value.command, " ")
+    end
+    return tostring(value.command)
+  end
+
+  -- Fallback to compact inspect
+  local text = vim.inspect(value, { indent = "  ", newline = " " })
+  if #text > max_len then
+    return text:sub(1, max_len) .. "..."
+  end
+  return text
+end
+
+local function format_tool_call_detail(tool_call, update)
+  local sections = {}
+
+  local kind = (tool_call and tool_call.kind) or update.kind
+  local tool_name = (tool_call and tool_call.tool_name) or (tool_call and tool_call.toolName) or update.tool_name
+  local locations = (tool_call and (tool_call.locations or tool_call.location)) or update.locations
+  local raw_input = (tool_call and (tool_call.rawInput or tool_call.raw_input)) or update.rawInput or update.raw_input
+  local raw_output = (tool_call and (tool_call.rawOutput or tool_call.raw_output)) or update.rawOutput or update.raw_output
+
+  if kind then
+    table.insert(sections, "Kind: " .. tostring(kind))
+  end
+  if tool_name then
+    table.insert(sections, "Name: " .. tostring(tool_name))
+  end
+
+  -- Format locations as simple paths
+  if locations then
+    local loc_text = extract_display_text(locations)
+    if loc_text then
+      table.insert(sections, "Locations: " .. loc_text)
+    end
+  end
+
+  -- Format input - show command or simplified view
+  if raw_input then
+    local input_text = extract_display_text(raw_input, 200)
+    if input_text then
+      table.insert(sections, "Input: " .. input_text)
+    end
+  end
+
+  -- Format output - extract actual content
+  if raw_output then
+    local output_text = extract_display_text(raw_output, 300)
+    if output_text then
+      table.insert(sections, "Output: " .. output_text)
+    end
+  end
+
+  return table.concat(sections, "\n")
+end
+
+local function log_session_update(payload, update_type, text)
+  local debug = config.get().debug or {}
+  if not debug.session_updates then
+    return
+  end
+
+  local path = debug.session_updates_path or (vim.fn.stdpath("cache") .. "/cog-session-updates.log")
+  local ok, fh = pcall(io.open, path, "a")
+  if not ok or not fh then
+    return
+  end
+
+  local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+  fh:write(string.format("[%s] type=%s text=%s\n", timestamp, tostring(update_type), tostring(text)))
+  fh:write(vim.inspect(payload))
+  fh:write("\n---\n")
+  fh:close()
 end
 
 local function parse_session_update(payload)
@@ -208,11 +427,52 @@ local function parse_session_update(payload)
     return nil, tostring(payload)
   end
 
-  local update = payload.update or payload
-  local update_type = update.type or payload.type
+  -- Only use nested update/sessionUpdate if they're tables, not type strings
+  local update
+  if type(payload.update) == "table" then
+    update = payload.update
+  elseif type(payload.sessionUpdate) == "table" then
+    update = payload.sessionUpdate
+  elseif type(payload.session_update) == "table" then
+    update = payload.session_update
+  else
+    update = payload
+  end
+
+  -- Check for explicit type indicator strings at ALL levels
+  -- The sessionUpdate field can be at payload level OR inside the nested update
+  local update_type
+
+  -- Check inside the nested update object first (most common case from logs)
+  if type(update.sessionUpdate) == "string" then
+    update_type = update.sessionUpdate
+  elseif type(update.session_update) == "string" then
+    update_type = update.session_update
+  -- Then check at payload level
+  elseif type(payload.sessionUpdate) == "string" then
+    update_type = payload.sessionUpdate
+  elseif type(payload.session_update) == "string" then
+    update_type = payload.session_update
+  elseif type(payload.update) == "string" then
+    update_type = payload.update
+  end
+
+  -- Fall back to nested type fields if no explicit indicator
+  if not update_type then
+    update_type = update.type
+      or update.update_type
+      or update.updateType
+      or update.event
+      or payload.type
+  end
+
+  -- NOTE: Don't use update.kind or payload.kind as update_type
+  -- because "kind" refers to the tool kind (read/write/bash), not the message type
+
+  local normalized_type = normalize_update_type(update_type)
   local text = extract_text_from_update(update)
 
-  return update_type, text, update
+  return normalized_type, text, update
 end
 
 local function resolve_permission_default(payload)
@@ -251,38 +511,134 @@ end
 
 function M.handle_event(event, payload)
   if event == "CogSessionUpdate" then
+    if type(payload) == "table" and is_list(payload) then
+      for _, item in ipairs(payload) do
+        M.handle_event("CogSessionUpdate", item)
+      end
+      return
+    end
+
     local update_type, text, update = parse_session_update(payload)
+    log_session_update(payload, update_type, text)
+
+    -- DEBUG: Uncomment to see what update_type is detected
+    -- vim.notify("update_type: " .. tostring(update_type), vim.log.levels.INFO)
+
     if ui.chat.is_pending() then
       ui.chat.clear_pending()
     end
-    if update_type == "agentMessageChunk" or update_type == "agentMessage" then
-      ui.chat.append_chunk("assistant", text)
+    if update_type == "agent_message_chunk" then
+      ui.chat.append_stream_chunk("assistant", text, "message")
       return
     end
 
-    if update_type == "agentThoughtChunk" or update_type == "agentThought" then
-      ui.chat.append_chunk("assistant", text)
+    if update_type == "agent_message" then
+      ui.chat.append_stream_chunk("assistant", text, "message")
+      ui.chat.end_stream("assistant")
       return
     end
 
-    if update_type == "toolCall" or update_type == "toolCallUpdate" then
-      local status = update.status or (update.toolCall and update.toolCall.status)
-      local title = update.title or (update.toolCall and update.toolCall.title) or "Tool"
+    if update_type == "agent_thought_chunk" then
+      ui.chat.append_stream_chunk("assistant", text, "thought")
+      return
+    end
+
+    if update_type == "agent_thought" then
+      ui.chat.append_stream_chunk("assistant", text, "thought")
+      ui.chat.end_stream("assistant")
+      return
+    end
+
+    if update_type == "tool_call" or update_type == "tool_call_update" then
+      ui.chat.end_stream("assistant")
+      local tool_call = update.toolCall or update.tool_call or payload.toolCall or payload.tool_call or update
+      local status = update.status or (tool_call and tool_call.status) or payload.status
+      local title = update.title or (tool_call and tool_call.title) or payload.title or "Tool"
       if status == "in_progress" then
         ui.progress.start(title)
       elseif status == "completed" or status == "failed" then
         ui.progress.finish(title .. " " .. status)
       end
-      local detail = update.content or update.message or update.result
-      local line = string.format("[Tool] %s — %s", title, status or "unknown")
-      if detail then
-        line = line .. ": " .. tostring(detail)
+      local tool_call_id = (tool_call and (tool_call.toolCallId or tool_call.tool_call_id or tool_call.id))
+        or update.toolCallId
+        or update.tool_call_id
+        or payload.toolCallId
+        or payload.tool_call_id
+
+      -- Extract tool kind for icon
+      local kind = (tool_call and tool_call.kind) or update.kind or payload.kind
+
+      -- Build structured tool data for cleaner display
+      local tool_data = {
+        kind = kind,
+        title = title,
+        status = status,
+      }
+
+      -- Extract command from rawInput
+      local raw_input = (tool_call and (tool_call.rawInput or tool_call.raw_input))
+        or update.rawInput or update.raw_input
+      if raw_input then
+        if raw_input.command then
+          if type(raw_input.command) == "table" then
+            -- Get the actual command (last element usually has the command)
+            local cmd = raw_input.command[#raw_input.command]
+            tool_data.command = cmd
+          else
+            tool_data.command = tostring(raw_input.command)
+          end
+        end
+        if raw_input.cwd then
+          tool_data.cwd = raw_input.cwd
+        end
       end
-      ui.chat.append("system", line)
+
+      -- Extract output from rawOutput
+      local raw_output = (tool_call and (tool_call.rawOutput or tool_call.raw_output))
+        or update.rawOutput or update.raw_output
+      if raw_output then
+        -- Prefer stdout, then aggregated_output, then formatted_output
+        tool_data.output = raw_output.stdout
+          or raw_output.aggregated_output
+          or raw_output.formatted_output
+        tool_data.exit_code = raw_output.exit_code
+      end
+
+      -- Extract locations
+      local locations = (tool_call and (tool_call.locations or tool_call.location))
+        or update.locations or update.location
+      if locations and type(locations) == "table" then
+        local paths = {}
+        for _, loc in ipairs(locations) do
+          if loc.path then
+            table.insert(paths, loc.path)
+          end
+        end
+        if #paths > 0 then
+          tool_data.locations = paths
+        end
+      end
+
+      ui.chat.upsert_tool_call(tool_call_id, tool_data)
       return
     end
 
-    ui.chat.append("assistant", text)
+    if update_type == "plan"
+      or update_type == "available_commands_update"
+      or update_type == "current_mode_update"
+      or update_type == "config_option_update"
+    then
+      ui.chat.end_stream("assistant")
+      ui.chat.append("system", text)
+      return
+    end
+
+    if text and text ~= "" then
+      ui.chat.append_stream_chunk("assistant", text, "message")
+      return
+    end
+
+    ui.chat.append("assistant", tostring(text))
     return
   end
 

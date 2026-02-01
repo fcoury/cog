@@ -12,6 +12,11 @@ function M.setup(opts)
 
   if cfg.keymaps then
     local km = cfg.keymaps
+    if km.toggle_chat then
+      vim.keymap.set("n", km.toggle_chat, function()
+        M.toggle_chat()
+      end, { desc = "Cog: Toggle chat" })
+    end
     if km.open_chat then
       vim.keymap.set("n", km.open_chat, function()
         M.open_chat()
@@ -57,6 +62,14 @@ end
 
 function M.open_chat()
   ui.chat.open()
+end
+
+function M.close_chat()
+  ui.chat.close()
+end
+
+function M.toggle_chat()
+  ui.chat.toggle()
 end
 
 function M.prompt()
