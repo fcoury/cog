@@ -1,5 +1,8 @@
 local M = {}
 
+local tracker = require("cog.buffer.tracker")
+local apply = require("cog.buffer.apply")
+
 function M.read(path)
   if not path or path == "" then
     return ""
@@ -8,7 +11,9 @@ function M.read(path)
   local bufnr = vim.fn.bufnr(path)
   if bufnr ~= -1 then
     local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-    return table.concat(lines, "\n")
+    local content = table.concat(lines, "\n")
+    tracker.record_read(path, content)
+    return content
   end
 
   local ok, lines = pcall(vim.fn.readfile, path)
@@ -16,23 +21,13 @@ function M.read(path)
     return ""
   end
 
-  return table.concat(lines, "\n")
+  local content = table.concat(lines, "\n")
+  tracker.record_read(path, content)
+  return content
 end
 
 function M.write(path, content)
-  if not path or path == "" then
-    return false, "missing path"
-  end
-
-  local bufnr = vim.fn.bufnr(path)
-  if bufnr == -1 then
-    bufnr = vim.fn.bufadd(path)
-    vim.fn.bufload(bufnr)
-  end
-
-  local lines = vim.split(content or "", "\n", { plain = true })
-  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-  return true, nil
+  return apply.apply(path, content or "")
 end
 
 return M
