@@ -760,7 +760,32 @@ local function append_stream_text(role, text)
     -- Apply styling to new lines
     local new_start = anchor_line
     local new_end = anchor_line + #extra - 1
-    apply_message_styling(bufnr, role, new_start, new_end)
+
+    -- Use dimmed styling for thinking content, regular styling otherwise
+    if state.stream.kind == "thought" then
+      local thinking_ns = vim.api.nvim_create_namespace("cog_thinking")
+      for line_idx = new_start, new_end do
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, thinking_ns, line_idx, 0, {
+          end_row = line_idx,
+          end_col = 0,
+          line_hl_group = "CogThinkingContent",
+          priority = 12,
+        })
+      end
+    else
+      apply_message_styling(bufnr, role, new_start, new_end)
+    end
+  end
+
+  -- Also apply thinking styling to the current anchor line (where content was appended)
+  if state.stream.kind == "thought" then
+    local thinking_ns = vim.api.nvim_create_namespace("cog_thinking")
+    pcall(vim.api.nvim_buf_set_extmark, bufnr, thinking_ns, anchor_line - 1, 0, {
+      end_row = anchor_line - 1,
+      end_col = 0,
+      line_hl_group = "CogThinkingContent",
+      priority = 12,
+    })
   end
 
   if extra_count > 0 then
@@ -811,18 +836,36 @@ end
 
 local function open_thought_block()
   if state.stream.kind ~= "thought" then
-    -- Render styled thinking header instead of raw <thinking> tag
+    local bufnr = get_message_buf()
+    local cfg = config.get().ui.chat or {}
+    local show_borders = cfg.show_borders ~= false
+    local border = show_borders and (BORDER.assistant .. " ") or ""
+
+    -- Render styled thinking header
     local thinking_icon = icons.tool_icons.thinking or "󰠗"
     local header_text = thinking_icon .. " Thinking"
-    append_stream_text(state.stream.role or "assistant", "\n" .. header_text .. "\n")
 
-    -- Apply styling to the header line
-    local bufnr = get_message_buf()
+    -- Append header line, then manually insert an empty line for content
+    append_stream_text(state.stream.role or "assistant", "\n" .. header_text)
+
+    -- The anchor now points to the header line. Insert a new empty line after it
+    -- for streaming content to flow into
     if state.stream.anchor_line and bufnr then
-      -- The header is at anchor_line - 1 (we just appended two lines: header and content start)
-      local header_line = state.stream.anchor_line - 1
+      -- Apply styling to the header line (anchor points to it)
+      local header_line = state.stream.anchor_line - 1  -- 0-indexed
       if header_line >= 0 then
         render_thinking_header(bufnr, header_line)
+      end
+
+      -- Insert empty line after header for content streaming
+      vim.api.nvim_buf_set_lines(bufnr, state.stream.anchor_line, state.stream.anchor_line, false, { border })
+      state.stream.anchor_line = state.stream.anchor_line + 1
+
+      -- Update message block tracking
+      local block_index = state.stream.block_index
+      if block_index and state.message_blocks[block_index] then
+        state.message_blocks[block_index].content_end =
+          state.message_blocks[block_index].content_end + 1
       end
     end
 
