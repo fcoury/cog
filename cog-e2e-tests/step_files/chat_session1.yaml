@@ -1,0 +1,20 @@
+# First session: open chat, close nvim
+session:
+  command: nvim
+  args: ["-u", "NONE", "--cmd", "set rtp+=/Volumes/External/code-external/cog/cog.nvim", "-c", "luafile /Volumes/External/code-external/cog/cog-e2e-tests/nvim_test_config/init.lua", "README.md"]
+  cols: 120
+  rows: 40
+
+steps:
+  - waitForIdle: {idleMs: 2000, timeoutMs: 15000}
+  - screenshot: {name: "01_session1_started"}
+  - type: {text: ":lua require('cog').toggle_chat()"}
+  - press: {key: "Enter"}
+  - waitForIdle: {idleMs: 2000, timeoutMs: 10000}
+  - screenshot: {name: "02_chat_opened"}
+  - type: {text: ":qa!"}
+  - press: {key: "Enter"}
+
+artifacts:
+  mode: always
+  dir: /Volumes/External/code-external/cog/cog-e2e-tests/test_artifacts/chat_persistence
