@@ -721,7 +721,7 @@ local function get_border_chars(status)
 end
 
 -- Render tool card from structured data
--- tool_data = { kind, title, status, command, output, locations, cwd, exit_code }
+-- tool_data = { kind, title, status, command, output, locations, cwd, exit_code, diff }
 local function render_tool_card_lines(tool_data)
   local cfg = config.get().ui.tool_calls or {}
   local show_icons = cfg.icons ~= false
@@ -769,6 +769,15 @@ local function render_tool_card_lines(tool_data)
   end
 
   -- Show output if present and completed
+  if tool_data.diff and tool_data.diff ~= "" then
+    table.insert(content_lines, "Diff:")
+    for line in tool_data.diff:gmatch("[^\n]+") do
+      if line ~= "" then
+        table.insert(content_lines, line)
+      end
+    end
+  end
+
   if tool_data.output and tool_data.output ~= "" and status == "completed" then
     for line in tool_data.output:gmatch("[^\n]+") do
       if line ~= "" then
@@ -1212,6 +1221,11 @@ function M.reset()
     local tool_ns = vim.api.nvim_create_namespace("cog_tool_card")
     vim.api.nvim_buf_clear_namespace(bufnr, tool_ns, 0, -1)
   end
+end
+
+-- Test helper: return message buffer id
+function M._get_message_buf()
+  return get_message_buf()
 end
 
 return M

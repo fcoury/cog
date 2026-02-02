@@ -26,8 +26,8 @@ function M.read(path)
   return content
 end
 
-function M.write(path, content)
-  return apply.apply(path, content or "")
+function M.write(path, content, opts)
+  return apply.apply(path, content or "", opts)
 end
 
 return M

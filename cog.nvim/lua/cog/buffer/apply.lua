@@ -22,6 +22,25 @@ local function compute_hunks(old_text, new_text)
   return vim.diff(old_text, new_text, { result_type = "indices" })
 end
 
+local function compute_diff_text(path, old_text, new_text)
+  local ok, unified = pcall(vim.diff, old_text, new_text, { result_type = "unified", ctxlen = 3 })
+  if ok and type(unified) == "string" and unified ~= "" then
+    return unified
+  end
+
+  local hunks = compute_hunks(old_text, new_text) or {}
+  local lines = {}
+  if path and path ~= "" then
+    table.insert(lines, "--- a/" .. path)
+    table.insert(lines, "+++ b/" .. path)
+  end
+  for _, hunk in ipairs(hunks) do
+    local old_start, old_count, new_start, new_count = unpack(hunk)
+    table.insert(lines, string.format("@@ -%d,%d +%d,%d @@", old_start, old_count, new_start, new_count))
+  end
+  return table.concat(lines, "\n")
+end
+
 local function apply_hunks(bufnr, new_text, hunks)
   local new_lines = vim.split(new_text, "\n", { plain = true })
 
@@ -42,7 +61,7 @@ local function apply_hunks(bufnr, new_text, hunks)
   end
 end
 
-local function apply_hunks_animated(bufnr, new_text, hunks, delay_ms)
+local function apply_hunks_animated(bufnr, new_text, hunks, delay_ms, on_step)
   local new_lines = vim.split(new_text, "\n", { plain = true })
   delay_ms = delay_ms or 50
 
@@ -64,6 +83,9 @@ local function apply_hunks_animated(bufnr, new_text, hunks, delay_ms)
           false,
           hunk_lines
         )
+        if on_step then
+          on_step()
+        end
       end)
       if not ok then
         vim.notify("Cog: animated apply failed: " .. tostring(err), vim.log.levels.ERROR)
@@ -83,13 +105,14 @@ local function has_conflict(path, current_text)
   return false, nil
 end
 
-function M.apply(path, new_text)
+function M.apply(path, new_text, opts)
   if not path or path == "" then
     return false, "missing path"
   end
 
   local bufnr = get_bufnr(path)
   local current_text = get_buffer_text(bufnr)
+  local base_text = current_text
   local conflict, conflict_data = has_conflict(path, current_text)
 
   local cfg = config.get()
@@ -98,6 +121,11 @@ function M.apply(path, new_text)
   if conflict and not auto_apply then
     ui_diff.show_conflict(path, conflict_data.base, conflict_data.ours, new_text)
     return false, "conflict detected"
+  end
+
+  local diff_callback = opts and opts.diff_callback
+  if diff_callback then
+    diff_callback(compute_diff_text(path, base_text, new_text))
   end
 
   local hunks = compute_hunks(current_text, new_text)
@@ -111,9 +139,16 @@ function M.apply(path, new_text)
   local animate = cfg.file_operations and cfg.file_operations.animate
   local delay = cfg.file_operations and cfg.file_operations.animate_delay_ms or 50
   if animate then
-    apply_hunks_animated(bufnr, new_text, hunks, delay)
+    apply_hunks_animated(bufnr, new_text, hunks, delay, function()
+      if diff_callback then
+        diff_callback(compute_diff_text(path, base_text, get_buffer_text(bufnr)))
+      end
+    end)
   else
     apply_hunks(bufnr, new_text, hunks)
+    if diff_callback then
+      diff_callback(compute_diff_text(path, base_text, get_buffer_text(bufnr)))
+    end
   end
 
   tracker.record_read(path, new_text)

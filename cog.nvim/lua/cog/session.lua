@@ -11,7 +11,16 @@ local state = {
   agent_info = nil,
   modes = nil,
   models = nil,
+  tool_call_cache = {},
+  active_edit_tool_calls = {},
 }
+
+local function normalize_path(path)
+  if not path or path == "" then
+    return nil
+  end
+  return vim.fn.fnamemodify(path, ":p")
+end
 
 local function find_codex_binary()
   local opts = config.get()
@@ -509,6 +518,27 @@ local function select_option_id(options, desired_kind)
   return nil
 end
 
+function M.update_tool_call_diff(tool_call_id, diff_text)
+  if not tool_call_id or not diff_text then
+    return
+  end
+
+  local cached = state.tool_call_cache[tool_call_id] or {}
+  local merged = vim.tbl_extend("force", {}, cached, { diff = diff_text })
+  if not merged.title then
+    merged.title = "Edit"
+  end
+  if not merged.kind then
+    merged.kind = "edit"
+  end
+  if not merged.status then
+    merged.status = "in_progress"
+  end
+
+  ui.chat.upsert_tool_call(tool_call_id, merged)
+  state.tool_call_cache[tool_call_id] = merged
+end
+
 function M.handle_event(event, payload)
   if event == "CogSessionUpdate" then
     if type(payload) == "table" and is_list(payload) then
@@ -567,6 +597,9 @@ function M.handle_event(event, payload)
 
       -- Extract tool kind for icon
       local kind = (tool_call and tool_call.kind) or update.kind or payload.kind
+      if type(kind) == "string" then
+        kind = kind:lower()
+      end
 
       -- Build structured tool data for cleaner display
       local tool_data = {
@@ -604,6 +637,14 @@ function M.handle_event(event, payload)
         tool_data.exit_code = raw_output.exit_code
       end
 
+      -- Extract diff text (if provided)
+      local diff_text = (tool_call and (tool_call.diffText or tool_call.diff_text))
+        or update.diffText or update.diff_text
+        or payload.diffText or payload.diff_text
+      if diff_text then
+        tool_data.diff = diff_text
+      end
+
       -- Extract locations
       local locations = (tool_call and (tool_call.locations or tool_call.location))
         or update.locations or update.location
@@ -620,6 +661,33 @@ function M.handle_event(event, payload)
       end
 
       ui.chat.upsert_tool_call(tool_call_id, tool_data)
+
+      -- Cache latest tool data for diff updates
+      if tool_call_id then
+        local cached = state.tool_call_cache[tool_call_id] or {}
+        for key, value in pairs(tool_data) do
+          if value ~= nil then
+            cached[key] = value
+          end
+        end
+        state.tool_call_cache[tool_call_id] = cached
+
+        -- Track active edit tool calls by path for write mapping
+        if cached.kind == "edit" and cached.locations then
+          for _, loc in ipairs(cached.locations) do
+            local normalized = normalize_path(loc)
+            if normalized then
+              if cached.status == "completed" or cached.status == "failed" then
+                if state.active_edit_tool_calls[normalized] == tool_call_id then
+                  state.active_edit_tool_calls[normalized] = nil
+                end
+              else
+                state.active_edit_tool_calls[normalized] = tool_call_id
+              end
+            end
+          end
+        end
+      end
       return
     end
 
@@ -651,6 +719,20 @@ function M.handle_event(event, payload)
     local request_id = payload.request_id
     local params = payload.params or {}
     local options = params.options or {}
+
+    local perm_opts = config.get().permissions or {}
+    if perm_opts.auto_approve then
+      local option_id = select_option_id(options, "allow_once")
+        or select_option_id(options, "allow_always")
+        or select_option_id(options, "approved")
+      if option_id then
+        backend.request("cog_permission_respond", {
+          request_id = request_id,
+          option_id = option_id,
+        })
+        return
+      end
+    end
 
     local desired = resolve_permission_default(payload)
     if desired and desired ~= "ask" then
@@ -691,7 +773,15 @@ function M.handle_event(event, payload)
     local request_id = payload.request_id
     local path = payload.path
     local content = payload.content
-    local ok, err = require("cog.buffer").write(path, content)
+    local normalized = normalize_path(path)
+    local tool_call_id = normalized and state.active_edit_tool_calls[normalized] or nil
+    local ok, err = require("cog.buffer").write(path, content, {
+      diff_callback = function(diff_text)
+        if tool_call_id then
+          M.update_tool_call_diff(tool_call_id, diff_text)
+        end
+      end,
+    })
     backend.request("cog_file_write_response", {
       request_id = request_id,
       success = ok,
