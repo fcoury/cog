@@ -21,17 +21,27 @@ local SEPARATOR = "─"
 
 local function setup_chat_buffer(buf)
   vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
-  vim.api.nvim_buf_set_option(buf, "bufhidden", "hide")
+  vim.api.nvim_buf_set_option(buf, "bufhidden", "wipe")
   vim.api.nvim_buf_set_option(buf, "swapfile", false)
   vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+  -- Clean up any stale buffer with this name first
+  local old_buf = vim.fn.bufnr("CogChat")
+  if old_buf ~= -1 and old_buf ~= buf then
+    pcall(vim.api.nvim_buf_delete, old_buf, { force = true })
+  end
   vim.api.nvim_buf_set_name(buf, "CogChat")
 end
 
 local function setup_input_buffer(buf)
   vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
-  vim.api.nvim_buf_set_option(buf, "bufhidden", "hide")
+  vim.api.nvim_buf_set_option(buf, "bufhidden", "wipe")
   vim.api.nvim_buf_set_option(buf, "swapfile", false)
   vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+  -- Clean up any stale buffer with this name first
+  local old_buf = vim.fn.bufnr("CogInput")
+  if old_buf ~= -1 and old_buf ~= buf then
+    pcall(vim.api.nvim_buf_delete, old_buf, { force = true })
+  end
   vim.api.nvim_buf_set_name(buf, "CogInput")
 end
 

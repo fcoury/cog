@@ -36,6 +36,7 @@ function M.setup(opts)
 
   vim.api.nvim_create_autocmd("VimLeavePre", {
     callback = function()
+      ui.chat.close() -- Close UI first
       session.disconnect()
     end,
   })

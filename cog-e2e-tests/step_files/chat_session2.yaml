@@ -1,0 +1,26 @@
+# Second session: verify nvim starts clean (no chat visible)
+session:
+  command: nvim
+  args: ["-u", "NONE", "--cmd", "set rtp+=/Volumes/External/code-external/cog/cog.nvim", "-c", "luafile /Volumes/External/code-external/cog/cog-e2e-tests/nvim_test_config/init.lua", "README.md"]
+  cols: 120
+  rows: 40
+
+steps:
+  - waitForIdle: {idleMs: 2000, timeoutMs: 15000}
+  - screenshot: {name: "03_session2_started"}
+  # Verify NO chat visible - should just see README without splits
+  - notExpectText: {text: "Type your message"}
+  - notExpectText: {text: "New Chat"}
+  - screenshot: {name: "04_no_chat_visible"}
+  # Now verify we CAN open chat (sanity check)
+  - type: {text: ":lua require('cog').toggle_chat()"}
+  - press: {key: "Enter"}
+  - waitForIdle: {idleMs: 2000, timeoutMs: 10000}
+  - waitForPattern: {pattern: "CogChat|CogInput|Type your message", timeoutMs: 5000}
+  - screenshot: {name: "05_chat_opened_fresh"}
+  - type: {text: ":qa!"}
+  - press: {key: "Enter"}
+
+artifacts:
+  mode: always
+  dir: /Volumes/External/code-external/cog/cog-e2e-tests/test_artifacts/chat_persistence
