@@ -1,0 +1,58 @@
+[
+  {
+    "step": 1,
+    "action": "waitForIdle",
+    "duration_ms": 2055,
+    "before_hash": 5548750716141498506,
+    "after_hash": 5548750716141498506,
+    "error": null
+  },
+  {
+    "step": 2,
+    "action": "screenshot",
+    "duration_ms": 0,
+    "before_hash": 5548750716141498506,
+    "after_hash": 5548750716141498506,
+    "error": null
+  },
+  {
+    "step": 3,
+    "action": "type",
+    "duration_ms": 0,
+    "before_hash": 5548750716141498506,
+    "after_hash": 5548750716141498506,
+    "error": null
+  },
+  {
+    "step": 4,
+    "action": "press",
+    "duration_ms": 0,
+    "before_hash": 5548750716141498506,
+    "after_hash": 5548750716141498506,
+    "error": null
+  },
+  {
+    "step": 5,
+    "action": "waitForIdle",
+    "duration_ms": 2063,
+    "before_hash": 5548750716141498506,
+    "after_hash": 5548750716141498506,
+    "error": null
+  },
+  {
+    "step": 6,
+    "action": "screenshot",
+    "duration_ms": 0,
+    "before_hash": 5548750716141498506,
+    "after_hash": 5548750716141498506,
+    "error": null
+  },
+  {
+    "step": 7,
+    "action": "waitForPattern",
+    "duration_ms": 10017,
+    "before_hash": 5548750716141498506,
+    "after_hash": 5548750716141498506,
+    "error": "Protocol error: error: Timeout after 10s waiting for: pattern 'CogChat|Type your message' to match"
+  }
+]

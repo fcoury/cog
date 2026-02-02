@@ -1,0 +1,70 @@
+session:
+  command: nvim
+  args: ["-u", "NONE", "--cmd", "set rtp+=/Volumes/External/code-external/cog/cog.nvim", "-c", "luafile /Volumes/External/code-external/cog/cog-e2e-tests/nvim_test_config/init.lua", "README.md"]
+  cols: 120
+  rows: 40
+
+steps:
+  # Wait for neovim to start and config to load
+  - waitForIdle: {idleMs: 2000, timeoutMs: 15000}
+  - screenshot: {name: "01_nvim_started"}
+
+  # Open chat using direct lua call
+  - type: {text: ":lua require('cog').toggle_chat()"}
+  - press: {key: "Enter"}
+  - waitForIdle: {idleMs: 2000, timeoutMs: 10000}
+  - screenshot: {name: "02_chat_opened"}
+
+  # Verify chat opened
+  - waitForPattern: {pattern: "CogChat|Type your message", timeoutMs: 10000}
+
+  # The chat should focus the input window, but after running a :lua command
+  # vim is in normal mode. We need to:
+  # 1. Make sure we're in the input window (it shows "CogInput" or has the placeholder)
+  # 2. Enter insert mode
+  # 3. Type the message
+
+  # Focus the input window explicitly - use the split focus function
+  - type: {text: ":lua require('cog.ui.split').focus_input()"}
+  - press: {key: "Enter"}
+  - waitForIdle: {idleMs: 500, timeoutMs: 5000}
+
+  # Enter insert mode
+  - press: {key: "i"}
+  - waitForIdle: {idleMs: 200, timeoutMs: 2000}
+  - screenshot: {name: "03_insert_mode"}
+
+  # Type the edit request
+  - type: {text: "Add a line at the end of README.md that says: TEST_MARKER_12345"}
+  - screenshot: {name: "04_typed_request"}
+
+  # Send message with Enter
+  - press: {key: "Enter"}
+  - waitForIdle: {idleMs: 500}
+
+  # Wait for thinking indicator
+  - waitForText: {text: "Thinking", timeoutMs: 30000}
+  - screenshot: {name: "05_thinking"}
+
+  # THIS IS WHERE THE BUG MANIFESTS - waiting for response
+  # If the tool call times out, we'll see it here
+  - waitForPattern: {pattern: "fs.write_text_file|apply_edits|TEST_MARKER|completed|Applied|write", timeoutMs: 120000}
+  - screenshot: {name: "06_response_received"}
+
+  # Wait for any processing to complete
+  - waitForIdle: {idleMs: 3000, timeoutMs: 20000}
+  - screenshot: {name: "07_after_response"}
+
+  # Final verification - check for success indicators
+  - waitForPattern: {pattern: "TEST_MARKER_12345|Applied|Success|completed", timeoutMs: 30000}
+  - screenshot: {name: "08_final_state"}
+
+  # Exit neovim cleanly
+  - press: {key: "Escape"}
+  - waitForIdle: {idleMs: 200}
+  - type: {text: ":qa!"}
+  - press: {key: "Enter"}
+
+artifacts:
+  mode: always
+  dir: /Volumes/External/code-external/cog/cog-e2e-tests/test_artifacts

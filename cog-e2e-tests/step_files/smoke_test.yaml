@@ -1,0 +1,34 @@
+session:
+  command: nvim
+  args: ["-u", "NONE", "--cmd", "set rtp+=/Volumes/External/code-external/cog/cog.nvim", "-c", "luafile /Volumes/External/code-external/cog/cog-e2e-tests/nvim_test_config/init.lua", "README.md"]
+  cols: 120
+  rows: 40
+
+steps:
+  # Wait for neovim to start and config to load
+  - waitForIdle: {idleMs: 2000, timeoutMs: 15000}
+  - screenshot: {name: "01_nvim_started"}
+
+  # Verify we can see the file
+  - expectText: {text: "README"}
+  - screenshot: {name: "02_readme_visible"}
+
+  # Open chat using direct lua call (more reliable for testing)
+  - type: {text: ":lua require('cog').toggle_chat()"}
+  - press: {key: "Enter"}
+  - waitForIdle: {idleMs: 2000, timeoutMs: 10000}
+  - screenshot: {name: "03_chat_opened"}
+
+  # Verify chat opened - look for CogChat in status line
+  - waitForPattern: {pattern: "CogChat|Type your message", timeoutMs: 10000}
+  - screenshot: {name: "04_chat_verified"}
+
+  # Exit cleanly
+  - press: {key: "Escape"}
+  - waitForIdle: {idleMs: 200}
+  - type: {text: ":qa!"}
+  - press: {key: "Enter"}
+
+artifacts:
+  mode: always
+  dir: /Volumes/External/code-external/cog/cog-e2e-tests/test_artifacts
