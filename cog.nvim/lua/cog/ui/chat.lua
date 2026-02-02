@@ -53,10 +53,10 @@ local fold_ranges = {}
 -- Returns a function that can be used as foldtext
 _G.CogFoldText = function()
   local line_count = vim.v.foldend - vim.v.foldstart + 1
-  -- Get the border character from the first folded line to preserve card structure
+  -- Get the accent bar from the first folded line to preserve style
   local first_line = vim.fn.getline(vim.v.foldstart)
-  local border_prefix = first_line:match("^(│[│┃]?)") or "││"
-  return string.format("%s  ▸ %d more lines (za to toggle)", border_prefix, line_count)
+  local accent_prefix = first_line:match("^(│[┃╏]?)") or "│┃"
+  return string.format("%s  ▸ %d more lines (za to toggle)", accent_prefix, line_count)
 end
 
 -- Setup fold settings for a window displaying the chat buffer
@@ -573,7 +573,12 @@ local function process_thinking_tags(lines)
       end
       in_thinking = false
       thinking_start = nil
-      -- Don't add the closing tag - just end the block
+      -- Add separator line and blank line after thinking block
+      local width = get_chat_width()
+      local separator_width = math.max(20, width - 4)
+      local separator = string.rep("─ ", math.floor(separator_width / 2))
+      table.insert(result, separator)
+      table.insert(result, "")
     else
       table.insert(result, line)
     end
@@ -789,8 +794,13 @@ end
 
 local function close_thought_block()
   if state.stream.kind == "thought" then
-    -- Use a visual end instead of raw tag
-    append_stream_text(state.stream.role or "assistant", "\n")
+    -- Add a dashed separator line after thinking content
+    local cfg = config.get().ui.chat or {}
+    local width = get_chat_width()
+    -- Account for border character and space
+    local separator_width = math.max(20, width - 4)
+    local separator = string.rep("─ ", math.floor(separator_width / 2))
+    append_stream_text(state.stream.role or "assistant", "\n" .. separator .. "\n\n")
     state.stream.kind = "message"
   end
 end
@@ -891,21 +901,6 @@ function M.set_message_tokens(tokens)
 end
 
 -- Tool card rendering helpers
-local function get_tool_border_hl(status)
-  if not status then
-    return "CogToolCardBorder"
-  end
-  local normalized = status:lower():gsub("[%s%-]", "_")
-  if normalized == "completed" or normalized == "success" or normalized == "done" then
-    return "CogToolCardBorderSuccess"
-  elseif normalized == "failed" or normalized == "error" then
-    return "CogToolCardBorderError"
-  elseif normalized == "pending" or normalized == "in_progress" or normalized == "running" then
-    return "CogToolCardBorderPending"
-  end
-  return "CogToolCardBorder"
-end
-
 local function get_tool_icon_hl(kind)
   if not kind then
     return "CogToolIcon"
@@ -961,45 +956,26 @@ local function truncate_lines(lines, max_lines)
   return result, true
 end
 
-local function get_border_chars(status)
-  local cfg = config.get().ui.tool_calls or {}
-  local border_cfg = cfg.border or {}
-
+-- Get the accent bar character based on status
+local function get_accent_bar(status)
   local is_error = status and (status:lower() == "failed" or status:lower() == "error")
-  local chars = is_error and border_cfg.error or border_cfg.normal
-
-  -- Fallback defaults
-  if not chars then
-    if is_error then
-      chars = {
-        top_left = "┌", top = "╌", top_right = "┐",
-        left = "╎", right = "╎",
-        bottom_left = "└", bottom = "╌", bottom_right = "┘",
-        header_left = "├", header_right = "┤",
-      }
-    else
-      chars = {
-        top_left = "┌", top = "─", top_right = "┐",
-        left = "│", right = "│",
-        bottom_left = "└", bottom = "─", bottom_right = "┘",
-        header_left = "├", header_right = "┤",
-      }
-    end
-  end
-  return chars
+  return is_error and "╏" or "┃"
 end
 
--- Render tool card from structured data
+-- Render tool card from structured data using left accent bar style
 -- tool_data = { kind, title, status, command, output, locations, cwd, exit_code, diff }
 local function render_tool_card_lines(tool_data)
   local cfg = config.get().ui.tool_calls or {}
   local show_icons = cfg.icons ~= false
   local max_preview = cfg.max_preview_lines or 8
+  local show_borders = (config.get().ui.chat or {}).show_borders ~= false
 
   local status = tool_data.status
   local kind = tool_data.kind
-  local border = get_border_chars(status)
-  local card_width = 55
+  local accent = get_accent_bar(status)
+
+  -- Message border prefix (to nest inside assistant message)
+  local msg_border = show_borders and (BORDER.assistant .. " ") or ""
 
   -- Build header with tool type
   local tool_icon = show_icons and icons.get_tool_icon(kind) or ""
@@ -1008,28 +984,46 @@ local function render_tool_card_lines(tool_data)
   -- Capitalize kind for display, fallback to "Tool"
   local display_kind = kind and (kind:sub(1,1):upper() .. kind:sub(2)) or "Tool"
 
-  local header_content = show_icons
-    and string.format(" %s %s ", tool_icon, display_kind)
-    or string.format(" %s ", display_kind)
-
-  local status_str = status_icon and string.format(" %s ", status_icon) or ""
-
-  -- Calculate header width
-  local header_len = vim.fn.strdisplaywidth(header_content)
-  local status_len = vim.fn.strdisplaywidth(status_str)
-  local fill_len = math.max(0, card_width - header_len - status_len - 2)
-  local fill = string.rep(border.top, fill_len)
+  -- Build summary for header (command or first location)
+  local summary = ""
+  if tool_data.command and tool_data.command ~= "" then
+    -- Truncate command if too long
+    summary = tool_data.command
+    if #summary > 40 then
+      summary = summary:sub(1, 37) .. "..."
+    end
+  elseif tool_data.locations and #tool_data.locations > 0 then
+    -- Show first location for read/write operations
+    local loc = tool_data.locations[1]
+    summary = loc:match("([^/]+)$") or loc
+    if #tool_data.locations > 1 then
+      summary = summary .. string.format(" +%d more", #tool_data.locations - 1)
+    end
+  end
 
   local lines = {}
 
-  -- Top border with tool type and status
-  table.insert(lines, border.top_left .. border.top .. header_content .. fill .. status_str .. border.top_right)
+  -- Header line: accent | icon kind status_icon  summary
+  local header_parts = {}
+  if show_icons and tool_icon ~= "" then
+    table.insert(header_parts, tool_icon)
+  end
+  table.insert(header_parts, display_kind)
+  if status_icon then
+    table.insert(header_parts, status_icon)
+  end
+  if summary ~= "" then
+    table.insert(header_parts, " " .. summary)
+  end
+
+  local header_line = msg_border .. accent .. "  " .. table.concat(header_parts, " ")
+  table.insert(lines, header_line)
 
   -- Collect content lines
   local content_lines = {}
 
-  -- Show locations if present (for read operations)
-  if tool_data.locations and #tool_data.locations > 0 then
+  -- Show locations if present (for read operations with multiple files)
+  if tool_data.locations and #tool_data.locations > 1 then
     for _, loc in ipairs(tool_data.locations) do
       -- Show just filename for brevity
       local filename = loc:match("([^/]+)$") or loc
@@ -1037,9 +1031,8 @@ local function render_tool_card_lines(tool_data)
     end
   end
 
-  -- Show output if present and completed
+  -- Show diff if present
   if tool_data.diff and tool_data.diff ~= "" then
-    table.insert(content_lines, "Diff:")
     for line in tool_data.diff:gmatch("[^\n]+") do
       if line ~= "" then
         table.insert(content_lines, line)
@@ -1047,6 +1040,7 @@ local function render_tool_card_lines(tool_data)
     end
   end
 
+  -- Show output if present and completed
   if tool_data.output and tool_data.output ~= "" and status == "completed" then
     for line in tool_data.output:gmatch("[^\n]+") do
       if line ~= "" then
@@ -1065,11 +1059,12 @@ local function render_tool_card_lines(tool_data)
   if #content_lines > 0 then
     local prepared_lines, fold_data = prepare_foldable_lines(content_lines, max_preview)
     for _, content_line in ipairs(prepared_lines) do
-      -- Truncate long lines
-      if #content_line > card_width - 4 then
-        content_line = content_line:sub(1, card_width - 7) .. "..."
+      -- Truncate long lines (wider allowed since no right border)
+      if #content_line > 70 then
+        content_line = content_line:sub(1, 67) .. "..."
       end
-      table.insert(lines, border.left .. "  " .. content_line)
+      -- Add with accent bar prefix (indented under header)
+      table.insert(lines, msg_border .. accent .. "    " .. content_line)
     end
 
     -- Convert fold info to absolute positions within card
@@ -1083,49 +1078,55 @@ local function render_tool_card_lines(tool_data)
     end
   end
 
-  -- Bottom border
-  local bottom_fill = string.rep(border.bottom, card_width + 1)
-  table.insert(lines, border.bottom_left .. bottom_fill .. border.bottom_right)
-
   return lines, fold_info
+end
+
+-- Get the highlight group for the accent bar based on status
+local function get_accent_bar_hl(status)
+  if not status then
+    return "CogToolAccentBar"
+  end
+  local normalized = status:lower():gsub("[%s%-]", "_")
+  if normalized == "completed" or normalized == "success" or normalized == "done" then
+    return "CogToolAccentBarSuccess"
+  elseif normalized == "failed" or normalized == "error" then
+    return "CogToolAccentBarError"
+  elseif normalized == "pending" or normalized == "in_progress" or normalized == "running" then
+    return "CogToolAccentBarPending"
+  end
+  return "CogToolAccentBar"
 end
 
 local function apply_tool_card_highlights(bufnr, start_line, lines, status, kind)
   local ns = vim.api.nvim_create_namespace("cog_tool_card")
-  local border_hl = get_tool_border_hl(status)
+  local accent_hl = get_accent_bar_hl(status)
   local icon_hl = get_tool_icon_hl(kind)
   local _, status_hl = icons.get_status_icon(status)
 
   for i, line in ipairs(lines) do
     local line_idx = start_line + i - 1
 
-    -- Apply border highlight to border characters
-    pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, 0, {
-      end_row = line_idx,
-      end_col = 0,
-      line_hl_group = "CogToolCardContent",
-      priority = 10,
-    })
-
-    -- Highlight border characters
-    local first_char = line:sub(1, 3)
-    if first_char:match("[┌└├│╎]") then
-      pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, 0, {
+    -- Find the accent bar character position (after message border)
+    local accent_start = line:find("[┃╏]")
+    if accent_start then
+      -- Highlight the accent bar character
+      pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, accent_start - 1, {
         end_row = line_idx,
-        end_col = 3,
-        hl_group = border_hl,
+        end_col = accent_start + 2,  -- UTF-8 character is 3 bytes
+        hl_group = accent_hl,
         priority = 20,
       })
     end
 
     -- Highlight the header line (first line with icon and title)
     if i == 1 then
-      -- Find and highlight the tool icon
-      local icon_start = line:find("[^ ─┌╌]", 2)
-      if icon_start then
-        pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, icon_start - 1, {
+      -- Find and highlight the tool icon (first non-space/bar character after accent)
+      local content_start = accent_start and accent_start + 4 or 0
+      local icon_match_start = line:find("[^%s┃╏│]", content_start)
+      if icon_match_start then
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, icon_match_start - 1, {
           end_row = line_idx,
-          end_col = icon_start + 4,
+          end_col = icon_match_start + 3,  -- Icon is typically 3-4 bytes
           hl_group = icon_hl,
           priority = 25,
         })
@@ -1138,30 +1139,29 @@ local function apply_tool_card_highlights(bufnr, start_line, lines, status, kind
         if status_pos then
           pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, status_pos - 1, {
             end_row = line_idx,
-            end_col = status_pos + #status_icon + 1,
+            end_col = status_pos + #status_icon,
             hl_group = status_hl,
             priority = 25,
           })
         end
       end
-    end
 
-    -- Highlight section headers (Input, Output)
-    if line:match("├.*Input") or line:match("├.*Output") then
-      local section_start = line:find("[IO]")
-      if section_start then
-        pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, section_start - 1, {
+      -- Apply header styling to the tool name
+      local display_kind = kind and (kind:sub(1,1):upper() .. kind:sub(2)) or "Tool"
+      local kind_pos = line:find(display_kind, 1, true)
+      if kind_pos then
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, kind_pos - 1, {
           end_row = line_idx,
-          end_col = section_start + 6,
-          hl_group = "CogToolSectionHeader",
-          priority = 25,
+          end_col = kind_pos + #display_kind - 1,
+          hl_group = "CogToolCardHeader",
+          priority = 22,
         })
       end
     end
 
     -- Diff highlighting - detect diff content in tool card lines
-    -- Strip border characters first to get content
-    local content = line:gsub("^[│╎]%s*", "")
+    -- Strip accent bar and spaces first to get content
+    local content = line:gsub("^[│┃╏%s]+", "")
 
     -- Hunk headers (@@ ... @@)
     if content:match("^@@.*@@") then

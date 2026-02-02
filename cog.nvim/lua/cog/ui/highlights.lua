@@ -11,13 +11,19 @@ function M.setup()
   vim.api.nvim_set_hl(0, "CogToolSuccess", { link = "DiagnosticOk", default = true })
   vim.api.nvim_set_hl(0, "CogToolFailure", { link = "DiagnosticError", default = true })
 
-  -- Tool card borders - use standard border/diagnostic colors
+  -- Tool card borders - use standard border/diagnostic colors (legacy)
   vim.api.nvim_set_hl(0, "CogToolCardBorder", { link = "FloatBorder", default = true })
   vim.api.nvim_set_hl(0, "CogToolCardBorderSuccess", { link = "DiagnosticOk", default = true })
   vim.api.nvim_set_hl(0, "CogToolCardBorderError", { link = "DiagnosticError", default = true })
   vim.api.nvim_set_hl(0, "CogToolCardBorderPending", { link = "DiagnosticWarn", default = true })
   vim.api.nvim_set_hl(0, "CogToolCardHeader", { link = "Title", default = true })
   vim.api.nvim_set_hl(0, "CogToolCardHeaderBg", { link = "NormalFloat", default = true })
+
+  -- Tool accent bar - left vertical bar indicating tool region (new minimal style)
+  vim.api.nvim_set_hl(0, "CogToolAccentBar", { link = "FloatBorder", default = true })
+  vim.api.nvim_set_hl(0, "CogToolAccentBarSuccess", { link = "DiagnosticOk", default = true })
+  vim.api.nvim_set_hl(0, "CogToolAccentBarError", { link = "DiagnosticError", default = true })
+  vim.api.nvim_set_hl(0, "CogToolAccentBarPending", { link = "DiagnosticWarn", default = true })
 
   -- Tool icons - use standard syntax and diagnostic colors
   vim.api.nvim_set_hl(0, "CogToolIcon", { link = "Special", default = true })
@@ -74,7 +80,7 @@ function M.setup()
   vim.api.nvim_set_hl(0, "CogSeparator", { link = "FloatBorder", default = true })
 
   -- Thinking blocks
-  vim.api.nvim_set_hl(0, "CogThinkingHeader", { link = "Comment", default = true })
+  vim.api.nvim_set_hl(0, "CogThinkingHeader", { italic = true, link = "Comment", default = true })
   vim.api.nvim_set_hl(0, "CogThinkingContent", { link = "Comment", default = true })
   vim.api.nvim_set_hl(0, "CogThinkingBorder", { link = "Comment", default = true })
 
