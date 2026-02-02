@@ -540,8 +540,12 @@ local function render_thinking_header(bufnr, line)
     priority = 15,
   })
 
-  -- Add separator as virtual text
-  pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line, #header_text + 2, {
+  -- Get the actual line content to find where header text ends
+  local line_content = vim.api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1] or ""
+  local content_len = #line_content
+
+  -- Add separator as virtual text at end of line
+  pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line, content_len, {
     virt_text = { { separator, "CogSeparator" } },
     virt_text_pos = "overlay",
     priority = 16,
