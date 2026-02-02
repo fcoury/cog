@@ -134,7 +134,7 @@ end
 -- Format message lines with border character
 local function format_message_lines(role, lines)
   local cfg = config.get().ui.chat or {}
-  local show_borders = cfg.show_borders ~= false
+  local show_borders = cfg.show_borders == true
 
   if not show_borders then
     return lines
@@ -203,6 +203,9 @@ end
 -- Apply extmarks for message styling
 local function apply_message_styling(bufnr, role, start_line, end_line)
   local ns = vim.api.nvim_create_namespace("cog_chat_styling")
+  local cfg = config.get().ui.chat or {}
+  local show_borders = cfg.show_borders == true
+
   local hl_groups = {
     user = "CogUserMessage",
     assistant = "CogAssistantMessage",
@@ -225,16 +228,19 @@ local function apply_message_styling(bufnr, role, start_line, end_line)
       line_hl_group = hl,
       priority = 10,
     })
-    -- Highlight just the border character (first 1-2 chars)
-    local line_content = vim.api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1] or ""
-    if #line_content > 0 then
-      local border_len = line_content:match("^[┃│┊] ") and 2 or 1
-      pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line, 0, {
-        end_row = line,
-        end_col = border_len,
-        hl_group = border_hl,
-        priority = 20,
-      })
+    -- Highlight border character only when borders are enabled and line starts with border
+    if show_borders then
+      local line_content = vim.api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1] or ""
+      local border_match = line_content:match("^([┃│┊]) ")
+      if border_match then
+        -- Border char is 3 bytes in UTF-8, plus space = 4 bytes
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line, 0, {
+          end_row = line,
+          end_col = 4,
+          hl_group = border_hl,
+          priority = 20,
+        })
+      end
     end
   end
 end
@@ -524,11 +530,15 @@ end
 -- Apply styled thinking header with separator (moved here for forward reference)
 local function render_thinking_header(bufnr, line)
   local ns = vim.api.nvim_create_namespace("cog_thinking")
+  local cfg = config.get().ui.chat or {}
+  local show_borders = cfg.show_borders == true
   local thinking_icon = icons.tool_icons.thinking or "󰠗"
   local width = get_chat_width()
   local header_text = thinking_icon .. " Thinking"
   local header_width = vim.fn.strdisplaywidth(header_text)
-  local separator_len = math.max(0, width - header_width - 4) -- -4 for border + spaces
+  -- Offset: 4 chars for border + spaces when borders enabled, 2 for padding when disabled
+  local border_offset = show_borders and 4 or 2
+  local separator_len = math.max(0, width - header_width - border_offset)
 
   local separator = " " .. string.rep("─", separator_len)
 
@@ -554,6 +564,8 @@ end
 
 -- Process thinking tags in text, returns processed lines and thinking region info
 local function process_thinking_tags(lines)
+  local cfg = config.get().ui.chat or {}
+  local show_borders = cfg.show_borders == true
   local result = {}
   local thinking_regions = {} -- {start_line, end_line} pairs for styling
   local in_thinking = false
@@ -579,7 +591,8 @@ local function process_thinking_tags(lines)
       thinking_start = nil
       -- Add separator line and blank line after thinking block
       local width = get_chat_width()
-      local separator_width = math.max(20, width - 4)
+      local border_offset = show_borders and 4 or 2
+      local separator_width = math.max(20, width - border_offset)
       local separator = string.rep("─ ", math.floor(separator_width / 2))
       table.insert(result, separator)
       table.insert(result, "")
@@ -654,26 +667,14 @@ function M.append(role, text)
   -- Apply content styling
   apply_message_styling(bufnr, role, content_start, content_end)
 
-  -- Apply thinking region styling
+  -- Apply thinking region styling (header only, content uses normal message styling)
   if #thinking_regions > 0 then
-    local thinking_ns = vim.api.nvim_create_namespace("cog_thinking")
     for _, region in ipairs(thinking_regions) do
       -- Adjust line numbers to buffer positions (account for border prefix in formatted lines)
       local header_buf_line = content_start + region.start_line - 1
-      local end_buf_line = content_start + region.end_line - 1
 
       -- Style the thinking header line
       render_thinking_header(bufnr, header_buf_line)
-
-      -- Apply dimmed styling to thinking content
-      for line_idx = header_buf_line + 1, end_buf_line do
-        pcall(vim.api.nvim_buf_set_extmark, bufnr, thinking_ns, line_idx, 0, {
-          end_row = line_idx,
-          end_col = 0,
-          line_hl_group = "CogThinkingContent",
-          priority = 12,
-        })
-      end
     end
   end
 
@@ -750,7 +751,7 @@ local function append_stream_text(role, text)
   local extra_count = 0
   if #parts > 1 then
     local extra = {}
-    local border = cfg.show_borders ~= false and (BORDER[role] or BORDER.system) .. " " or ""
+    local border = cfg.show_borders == true and (BORDER[role] or BORDER.system) .. " " or ""
     for i = 2, #parts do
       table.insert(extra, border .. parts[i])
     end
@@ -760,32 +761,7 @@ local function append_stream_text(role, text)
     -- Apply styling to new lines
     local new_start = anchor_line
     local new_end = anchor_line + #extra - 1
-
-    -- Use dimmed styling for thinking content, regular styling otherwise
-    if state.stream.kind == "thought" then
-      local thinking_ns = vim.api.nvim_create_namespace("cog_thinking")
-      for line_idx = new_start, new_end do
-        pcall(vim.api.nvim_buf_set_extmark, bufnr, thinking_ns, line_idx, 0, {
-          end_row = line_idx,
-          end_col = 0,
-          line_hl_group = "CogThinkingContent",
-          priority = 12,
-        })
-      end
-    else
-      apply_message_styling(bufnr, role, new_start, new_end)
-    end
-  end
-
-  -- Also apply thinking styling to the current anchor line (where content was appended)
-  if state.stream.kind == "thought" then
-    local thinking_ns = vim.api.nvim_create_namespace("cog_thinking")
-    pcall(vim.api.nvim_buf_set_extmark, bufnr, thinking_ns, anchor_line - 1, 0, {
-      end_row = anchor_line - 1,
-      end_col = 0,
-      line_hl_group = "CogThinkingContent",
-      priority = 12,
-    })
+    apply_message_styling(bufnr, role, new_start, new_end)
   end
 
   if extra_count > 0 then
@@ -825,9 +801,11 @@ local function close_thought_block()
   if state.stream.kind == "thought" then
     -- Add a dashed separator line after thinking content
     local cfg = config.get().ui.chat or {}
+    local show_borders = cfg.show_borders == true
     local width = get_chat_width()
-    -- Account for border character and space
-    local separator_width = math.max(20, width - 4)
+    -- Account for border character and space when borders enabled
+    local border_offset = show_borders and 4 or 2
+    local separator_width = math.max(20, width - border_offset)
     local separator = string.rep("─ ", math.floor(separator_width / 2))
     append_stream_text(state.stream.role or "assistant", "\n" .. separator .. "\n\n")
     state.stream.kind = "message"
@@ -838,15 +816,16 @@ local function open_thought_block()
   if state.stream.kind ~= "thought" then
     local bufnr = get_message_buf()
     local cfg = config.get().ui.chat or {}
-    local show_borders = cfg.show_borders ~= false
-    local border = show_borders and (BORDER.assistant .. " ") or ""
+    local show_borders = cfg.show_borders == true
+    local role = state.stream.role or "assistant"
+    local border = show_borders and ((BORDER[role] or BORDER.assistant) .. " ") or ""
 
     -- Render styled thinking header
     local thinking_icon = icons.tool_icons.thinking or "󰠗"
     local header_text = thinking_icon .. " Thinking"
 
     -- Append header line, then manually insert an empty line for content
-    append_stream_text(state.stream.role or "assistant", "\n" .. header_text)
+    append_stream_text(role, "\n" .. header_text)
 
     -- The anchor now points to the header line. Insert a new empty line after it
     -- for streaming content to flow into
@@ -858,14 +837,26 @@ local function open_thought_block()
       end
 
       -- Insert empty line after header for content streaming
-      vim.api.nvim_buf_set_lines(bufnr, state.stream.anchor_line, state.stream.anchor_line, false, { border })
+      local insert_line = state.stream.anchor_line
+      vim.api.nvim_buf_set_lines(bufnr, insert_line, insert_line, false, { border })
+
+      -- Apply styling to the inserted line
+      apply_message_styling(bufnr, role, insert_line, insert_line)
+
       state.stream.anchor_line = state.stream.anchor_line + 1
 
-      -- Update message block tracking
+      -- Update message block tracking and shift subsequent blocks
       local block_index = state.stream.block_index
       if block_index and state.message_blocks[block_index] then
         state.message_blocks[block_index].content_end =
           state.message_blocks[block_index].content_end + 1
+        -- Shift any blocks that come after this one
+        shift_message_blocks_after(block_index, 1)
+      end
+
+      -- Update last_line if it's after the insertion point
+      if state.last_line and state.last_line > insert_line then
+        state.last_line = state.last_line + 1
       end
     end
 
@@ -1015,7 +1006,7 @@ local function render_tool_card_lines(tool_data)
   local cfg = config.get().ui.tool_calls or {}
   local show_icons = cfg.icons ~= false
   local max_preview = cfg.max_preview_lines or 8
-  local show_borders = (config.get().ui.chat or {}).show_borders ~= false
+  local show_borders = (config.get().ui.chat or {}).show_borders == true
 
   local status = tool_data.status
   local kind = tool_data.kind
@@ -1320,13 +1311,17 @@ function M.upsert_tool_call(tool_call_id, tool_data)
 
     local delta = new_count - old_count
     if delta ~= 0 then
+      local old_content_end = block.content_end
       block.content_end = block.content_end + delta
       shift_message_blocks_after(block_index, delta)
 
       if state.last_line then
         local last_zero_based = state.last_line - 1
-        if last_zero_based > block.content_end - delta then
+        if last_zero_based > old_content_end then
           state.last_line = state.last_line + delta
+        elseif last_zero_based == old_content_end then
+          -- last_line was exactly at the old end, move it to new end
+          state.last_line = block.content_end + 1
         end
       end
     end
@@ -1388,6 +1383,7 @@ function M.upsert_tool_call(tool_call_id, tool_data)
     end
 
     state.last_line = content_end + 1
+    state.last_role = "tool"
   end
 
   -- Scroll to bottom
@@ -1403,7 +1399,7 @@ end
 function M.append_chunk(role, text)
   local bufnr = get_message_buf()
   local cfg = config.get().ui.chat or {}
-  local show_borders = cfg.show_borders ~= false
+  local show_borders = cfg.show_borders == true
 
   if not state.last_line or state.last_role ~= role then
     M.append(role, text)
@@ -1466,6 +1462,8 @@ function M.begin_pending()
 
   local meta = M.append("system", cfg.pending_message or "Thinking...")
   state.pending.active = true
+  -- Track which block this is so we can remove it later
+  state.pending.block_index = #state.message_blocks
   -- Include the padding line in the range (it's at prefix_line - 2 if there was padding)
   local range_start = meta.prefix_line - 1
   -- Check if there was a padding line before the header
@@ -1524,8 +1522,20 @@ function M.clear_pending()
     end
   end
 
+  -- Remove the pending block from message_blocks and shift subsequent blocks
+  local block_index = state.pending.block_index
+  if block_index and state.message_blocks[block_index] then
+    -- Shift any blocks after the pending one (unlikely but be safe)
+    if lines_deleted > 0 then
+      shift_message_blocks_after(block_index, -lines_deleted)
+    end
+    -- Remove the pending block
+    table.remove(state.message_blocks, block_index)
+  end
+
   state.pending.active = false
   state.pending.range = nil
+  state.pending.block_index = nil
 
   -- Restore message state from before pending was shown
   -- This ensures streaming chunks continue from the correct position

@@ -35,7 +35,7 @@ M.defaults = {
 			stream_idle_timeout_ms = 300,
 
 			-- Visual options (OpenCode-inspired)
-			show_borders = true, -- Show left border on messages
+			show_borders = false, -- Show left border on messages (disabled by default for cleaner look)
 			show_header = true, -- Show header with session info (winbar)
 			show_footer = true, -- Show footer with status in statusline
 			show_input_placeholder = true, -- Show placeholder text in empty input

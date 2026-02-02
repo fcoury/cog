@@ -34,7 +34,7 @@ require("cog").setup({
       width = "50%", -- Wider for visual testing
       border = "rounded",
       input_height = 5,
-      show_borders = true,
+      show_borders = false, -- Borders disabled by default for cleaner look
       show_header = true,
       message_padding = 1,
       user_icon = "●",
