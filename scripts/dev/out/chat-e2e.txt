@@ -1,0 +1,91 @@
+
+○ System
+┊ {
+┊   availableCommands = { {
+┊       description = "Review my current changes and find issues",
+┊       input = {
+┊         hint = "optional custom review instructions"
+┊       },
+┊       name = "review"
+┊     }, {
+┊       description = "Review the code changes against a specific branch",
+┊       input = {
+┊         hint = "branch name"
+┊       },
+┊       name = "review-branch"
+┊     }, {
+┊       description = "Review the code changes introduced by a commit",
+┊       input = {
+┊         hint = "commit sha"
+┊       },
+┊       name = "review-commit"
+┊     }, {
+┊       description = "create an AGENTS.md file with instructions for Codex",
+┊       input = vim.NIL,
+┊       name = "init"
+┊     }, {
+┊       description = "summarize conversation to prevent hitting the context limit",
+┊       input = vim.NIL,
+┊       name = "compact"
+┊     }, {
+┊       description = "undo Codex’s most recent turn",
+┊       input = vim.NIL,
+┊       name = "undo"
+┊     }, {
+┊       description = "logout of Codex",
+┊       input = vim.NIL,
+┊       name = "logout"
+┊     }, {
+┊       description = "Build with RepoPrompt MCP tools context builder → chat → implement",
+┊       input = vim.NIL,
+┊       name = "rp-build"
+┊     }, {
+┊       description = "Deep codebase investigation and architecture research with RepoPrompt MCP tools",
+┊       input = vim.NIL,
+┊       name = "rp-investigate"
+┊     }, {
+┊       description = "Export context for oracle consultation using RepoPrompt MCP tools",
+┊       input = vim.NIL,
+┊       name = "rp-oracle-export"
+┊     }, {
+┊       description = "Reminder to use RepoPrompt MCP tools",
+┊       input = vim.NIL,
+┊       name = "rp-reminder"
+┊     } },
+┊   sessionUpdate = "available_commands_update"
+┊ }
+
+● You
+┃ Replace the entire contents of README.md with exactly:\nCOG_E2E_MARKER\n
+
+◆ Assistant
+│ 
+│ <thinking>
+│ 
+│ **Applying patch directly due to sandbox restrictions**
+│ </thinking>
+│ 
+
+┌─  Edit ─────────────────────────────────────────── ✓ ┐
+│  README.md
+│  Success. Updated the following files:
+│  D README.md
+└────────────────────────────────────────────────────────┘
+
+◆ Assistant
+│ 
+│ <thinking>
+│ 
+│ **Adding new file content**
+│ 
+│ I'm preparing to add a new file by applying its content as a patch after deleting the old file.
+│ </thinking>
+│ 
+
+┌─  Edit ─────────────────────────────────────────── ◐ ┐
+│  README.md
+│  Diff:
+│  @@ -0,0 +1 @@
+│  +COG_E2E_MARKER
+│  ...
+└────────────────────────────────────────────────────────┘

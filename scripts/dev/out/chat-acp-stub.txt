@@ -1,0 +1,17 @@
+
+● You
+┃ Use the stub to write the file and report success.
+
+◆ Assistant
+│ Stub: streaming response.
+
+┌─  Edit ─────────────────────────────────────────── ◐ ┐
+│  target.txt
+│  Diff:
+│  @@ -1 +1,2 @@
+│  -Original content
+│  \ No newline at end of file
+│  +Stub wrote this line
+│  +And another line
+│  ... (2 more lines)
+└────────────────────────────────────────────────────────┘
