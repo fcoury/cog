@@ -3,8 +3,8 @@ mod rpc;
 
 use acp::{AcpClient, AcpConnection, AcpInbound};
 use anyhow::{anyhow, Result};
-use rpc::{as_single_param, parse_message, encode_response, RpcClient, RpcMessage};
 use rmpv::Value;
+use rpc::{as_single_param, encode_response, parse_message, RpcClient, RpcMessage};
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::Value as JsonValue;
@@ -103,8 +103,13 @@ impl AppState {
         let args = vec![Value::from(event), json_to_rmpv(&payload)];
         let params = vec![Value::from(code), Value::Array(args)];
         let rx = self.rpc.request("nvim_exec_lua", params);
+
+        let event_name = event.to_string();
         tokio::spawn(async move {
-            let _ = rx.await;
+            match rx.await {
+                Ok(_) => tracing::debug!("notify_lua succeeded: {}", event_name),
+                Err(e) => tracing::error!("notify_lua FAILED for {}: {}", event_name, e),
+            }
         });
     }
 }
@@ -135,7 +140,11 @@ async fn main() -> Result<()> {
         };
 
         match msg {
-            RpcMessage::Response { msgid, error, result } => {
+            RpcMessage::Response {
+                msgid,
+                error,
+                result,
+            } => {
                 rpc_client.handle_response(msgid, error, result);
             }
             RpcMessage::Notification { .. } => {
@@ -152,7 +161,9 @@ async fn main() -> Result<()> {
                     let result = handle_request(state_clone, method, params).await;
                     let response = match result {
                         Ok(val) => encode_response(msgid, None, Some(val)),
-                        Err(err) => encode_response(msgid, Some(Value::from(err.to_string())), None),
+                        Err(err) => {
+                            encode_response(msgid, Some(Value::from(err.to_string())), None)
+                        }
                     };
                     let _ = tx.send(response);
                 });
@@ -242,9 +253,9 @@ async fn handle_connect(state: Arc<AppState>, params: Vec<Value>) -> Result<Valu
     tracing::info!("sending initialize request...");
     let init_result = client.request("initialize", init_params).await;
     tracing::info!("initialize result: {:?}", init_result);
-    
+
     let stderr_lines = stderr_handle.await.unwrap_or_default();
-    
+
     match init_result {
         Ok(resp) => Ok(json_to_rmpv(&resp)),
         Err(e) => {
@@ -343,10 +354,7 @@ async fn handle_cancel(state: Arc<AppState>, params: Vec<Value>) -> Result<Value
     let params: CancelParams = as_single_param(params)?;
     let client = get_client(&state).await?;
     let _ = client
-        .request(
-            "session/cancel",
-            json!({ "sessionId": params.session_id }),
-        )
+        .request("session/cancel", json!({ "sessionId": params.session_id }))
         .await?;
     Ok(Value::from(true))
 }
@@ -376,7 +384,9 @@ async fn handle_file_write_response(state: Arc<AppState>, params: Vec<Value>) ->
         if params.success {
             let _ = tx.send(Ok(()));
         } else {
-            let _ = tx.send(Err(params.message.unwrap_or_else(|| "unknown error".into())));
+            let _ = tx.send(Err(params
+                .message
+                .unwrap_or_else(|| "unknown error".into())));
         }
     }
     Ok(Value::from(true))
@@ -389,7 +399,9 @@ async fn handle_tool_response(state: Arc<AppState>, params: Vec<Value>) -> Resul
         if params.ok {
             let _ = tx.send(Ok(params.result.unwrap_or(JsonValue::Null)));
         } else {
-            let _ = tx.send(Err(anyhow!(params.error.unwrap_or_else(|| "tool error".into()))));
+            let _ = tx.send(Err(anyhow!(params
+                .error
+                .unwrap_or_else(|| "tool error".into()))));
         }
     }
     Ok(Value::from(true))
@@ -424,135 +436,203 @@ async fn handle_acp_inbound(
     client: AcpClient,
     inbound_rx: &mut mpsc::UnboundedReceiver<AcpInbound>,
 ) {
+    tracing::info!("handle_acp_inbound: starting inbound message loop");
     while let Some(msg) = inbound_rx.recv().await {
         match msg {
             AcpInbound::Notification { method, params } => {
+                tracing::info!("ACP notification received: {}", method);
                 if method == "session/update" {
+                    tracing::debug!("session/update params: {:?}", params);
                     state.notify_lua("CogSessionUpdate", params).await;
                 } else {
-                    state.notify_lua("CogAcpNotification", json!({"method": method, "params": params})).await;
+                    tracing::debug!("other notification: {} params: {:?}", method, params);
+                    state
+                        .notify_lua(
+                            "CogAcpNotification",
+                            json!({"method": method, "params": params}),
+                        )
+                        .await;
                 }
             }
-            AcpInbound::Request { id, method, params } => {
-                match method.as_str() {
-                    "fs/read_text_file" => {
-                        let path = params
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let line = params.get("line").cloned().unwrap_or(JsonValue::Null);
-                        let limit = params.get("limit").cloned().unwrap_or(JsonValue::Null);
+            AcpInbound::Request { id, method, params } => match method.as_str() {
+                "fs/read_text_file" => {
+                    let path = params
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let line = params.get("line").cloned().unwrap_or(JsonValue::Null);
+                    let limit = params.get("limit").cloned().unwrap_or(JsonValue::Null);
 
-                        let (tx, rx) = oneshot::channel();
-                        state.pending_read.lock().await.insert(id, tx);
+                    let (tx, rx) = oneshot::channel();
+                    state.pending_read.lock().await.insert(id, tx);
 
-                        state
-                            .notify_lua(
-                                "CogFileRead",
-                                json!({
-                                    "request_id": id,
-                                    "path": path,
-                                    "line": line,
-                                    "limit": limit,
-                                }),
-                            )
-                            .await;
+                    state
+                        .notify_lua(
+                            "CogFileRead",
+                            json!({
+                                "request_id": id,
+                                "path": path,
+                                "line": line,
+                                "limit": limit,
+                            }),
+                        )
+                        .await;
 
-                        let content = rx.await.unwrap_or_default();
-                        let _ = client
-                            .respond(id, Ok(json!({ "content": content })))
-                            .await;
-                    }
-                    "fs/write_text_file" => {
-                        let path = params
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let content = params
-                            .get("content")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        let (tx, rx) = oneshot::channel();
-                        state.pending_write.lock().await.insert(id, tx);
-
-                        state
-                            .notify_lua(
-                                "CogFileWrite",
-                                json!({
-                                    "request_id": id,
-                                    "path": path,
-                                    "content": content,
-                                }),
-                            )
-                            .await;
-
-                        let result = rx.await.unwrap_or_else(|_| Err("write failed".into()));
-                        let _ = client
-                            .respond(
-                                id,
-                                result.map(|_| json!({})).map_err(|e| anyhow!(e)),
-                            )
-                            .await;
-                    }
-                    "session/request_permission" => {
-                        let (tx, rx) = oneshot::channel();
-                        state.pending_permission.lock().await.insert(id, tx);
-                        state
-                            .notify_lua(
-                                "CogPermissionRequest",
-                                json!({
-                                    "request_id": id,
-                                    "params": params,
-                                }),
-                            )
-                            .await;
-
-                        let option_id = rx.await.unwrap_or_default();
-                        let _ = client
-                            .respond(
-                                id,
-                                Ok(json!({
-                                    "optionId": option_id,
-                                })),
-                            )
-                            .await;
-                    }
-                    method_name if method_name.starts_with("_cog.nvim/") => {
-                        let (tx, rx) = oneshot::channel();
-                        state.pending_tool.lock().await.insert(id, tx);
-                        state
-                            .notify_lua(
-                                "CogToolRequest",
-                                json!({
-                                    "request_id": id,
-                                    "method": method_name,
-                                    "params": params,
-                                }),
-                            )
-                            .await;
-
-                        let result = rx.await.unwrap_or_else(|_| Err(anyhow!("tool failed")));
-                        let _ = client.respond(id, result).await;
-                    }
-                    _ => {
-                        let _ = client
-                            .respond(id, Err(anyhow!("unsupported method")))
-                            .await;
-                    }
+                    let content = oneshot_with_timeout(rx, 30, "Lua file read response").await;
+                    let _ = client.respond(id, Ok(json!({ "content": content }))).await;
                 }
-            }
+                "fs/write_text_file" => {
+                    let path = params
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let content = params
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let (tx, rx) = oneshot::channel();
+                    state.pending_write.lock().await.insert(id, tx);
+
+                    state
+                        .notify_lua(
+                            "CogFileWrite",
+                            json!({
+                                "request_id": id,
+                                "path": path,
+                                "content": content,
+                            }),
+                        )
+                        .await;
+
+                    let result = oneshot_result_with_timeout(rx, 30, "Lua file write response", "write failed").await;
+                    let _ = client
+                        .respond(id, result.map(|_| json!({})))
+                        .await;
+                }
+                "session/request_permission" => {
+                    let (tx, rx) = oneshot::channel();
+                    state.pending_permission.lock().await.insert(id, tx);
+                    state
+                        .notify_lua(
+                            "CogPermissionRequest",
+                            json!({
+                                "request_id": id,
+                                "params": params,
+                            }),
+                        )
+                        .await;
+
+                    // Permissions may need longer timeout for user interaction
+                    let option_id = oneshot_with_timeout(rx, 120, "Lua permission response").await;
+                    let _ = client
+                        .respond(
+                            id,
+                            Ok(json!({
+                                "optionId": option_id,
+                            })),
+                        )
+                        .await;
+                }
+                method_name if method_name.starts_with("_cog.nvim/") => {
+                    let (tx, rx) = oneshot::channel();
+                    state.pending_tool.lock().await.insert(id, tx);
+                    state
+                        .notify_lua(
+                            "CogToolRequest",
+                            json!({
+                                "request_id": id,
+                                "method": method_name,
+                                "params": params,
+                            }),
+                        )
+                        .await;
+
+                    let result = oneshot_result_with_timeout(rx, 60, "Lua tool response", "tool failed").await;
+                    let _ = client.respond(id, result).await;
+                }
+                _ => {
+                    let _ = client.respond(id, Err(anyhow!("unsupported method"))).await;
+                }
+            },
         }
     }
+    tracing::warn!("handle_acp_inbound: loop exited - ACP connection closed or lost");
 }
 
 async fn get_client(state: &AppState) -> Result<AcpClient> {
     let lock = state.acp.lock().await;
     let conn = lock.as_ref().ok_or_else(|| anyhow!("not connected"))?;
     Ok(conn.client.clone())
+}
+
+/// Wait for a oneshot channel with a timeout.
+/// Uses std::thread-based timeout since tokio::time doesn't work properly under neovim.
+async fn oneshot_with_timeout<T: Default>(
+    mut rx: oneshot::Receiver<T>,
+    timeout_secs: u64,
+    description: &str,
+) -> T {
+    let (timeout_tx, timeout_rx) = std::sync::mpsc::channel();
+    let desc = description.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+        let _ = timeout_tx.send(());
+    });
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        match rx.try_recv() {
+            Ok(val) => return val,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                tracing::warn!("oneshot channel closed while waiting for {}", desc);
+                return T::default();
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                if timeout_rx.try_recv().is_ok() {
+                    tracing::error!("TIMEOUT waiting for {} after {} seconds", desc, timeout_secs);
+                    return T::default();
+                }
+            }
+        }
+    }
+}
+
+/// Wait for a oneshot channel with a timeout, returning Result.
+async fn oneshot_result_with_timeout<T, E: std::fmt::Display>(
+    mut rx: oneshot::Receiver<Result<T, E>>,
+    timeout_secs: u64,
+    description: &str,
+    default_err: &str,
+) -> Result<T> {
+    let (timeout_tx, timeout_rx) = std::sync::mpsc::channel();
+    let desc = description.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+        let _ = timeout_tx.send(());
+    });
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        match rx.try_recv() {
+            Ok(result) => {
+                return result.map_err(|e| anyhow!("{}", e));
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                tracing::warn!("oneshot channel closed while waiting for {}", desc);
+                return Err(anyhow!("{}", default_err));
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                if timeout_rx.try_recv().is_ok() {
+                    tracing::error!("TIMEOUT waiting for {} after {} seconds", desc, timeout_secs);
+                    return Err(anyhow!("timeout waiting for {}", desc));
+                }
+            }
+        }
+    }
 }
 
 fn json_to_rmpv(value: &JsonValue) -> Value {

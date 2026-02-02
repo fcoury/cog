@@ -10,8 +10,15 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 #[derive(Debug)]
 pub enum AcpInbound {
-    Notification { method: String, params: JsonValue },
-    Request { id: u64, method: String, params: JsonValue },
+    Notification {
+        method: String,
+        params: JsonValue,
+    },
+    Request {
+        id: u64,
+        method: String,
+        params: JsonValue,
+    },
 }
 
 #[derive(Clone)]
@@ -43,12 +50,20 @@ impl AcpClient {
         if !env.is_empty() {
             cmd.envs(env);
         }
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("missing stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("missing stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| anyhow!("missing stderr"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("missing stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("missing stderr"))?;
 
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<JsonValue>>>>> =
@@ -67,11 +82,13 @@ impl AcpClient {
 
         // Read stdout and process messages
         tokio::spawn(async move {
+            tracing::info!("ACP stdout reader started");
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 if line.trim().is_empty() {
                     continue;
                 }
+                tracing::debug!("ACP stdout raw: {}", line);
                 let parsed: Result<JsonValue> = serde_json::from_str(&line).map_err(|e| e.into());
                 let value = match parsed {
                     Ok(v) => v,
@@ -89,26 +106,35 @@ impl AcpClient {
                             .unwrap_or("unknown")
                             .to_string();
                         let params = value.get("params").cloned().unwrap_or(JsonValue::Null);
+                        tracing::info!("ACP request received: id={} method={}", id, method);
                         let _ = inbound_tx.send(AcpInbound::Request { id, method, params });
                     } else {
                         // response to our request
+                        tracing::debug!("ACP response received: id={}", id);
                         let result = if let Some(err) = value.get("error") {
+                            tracing::warn!("ACP response error: id={} err={}", id, err);
                             Err(anyhow!("acp error: {err}"))
                         } else {
                             Ok(value.get("result").cloned().unwrap_or(JsonValue::Null))
                         };
                         if let Some(tx) = pending_clone.lock().unwrap().remove(&id) {
                             let _ = tx.send(result);
+                        } else {
+                            tracing::warn!("ACP response for unknown id={} (no pending request)", id);
                         }
                     }
                 } else if let Some(method) = value.get("method").and_then(|v| v.as_str()) {
                     let params = value.get("params").cloned().unwrap_or(JsonValue::Null);
+                    tracing::info!("ACP notification received: method={}", method);
                     let _ = inbound_tx.send(AcpInbound::Notification {
                         method: method.to_string(),
                         params,
                     });
+                } else {
+                    tracing::warn!("ACP unknown message format: {:?}", value);
                 }
             }
+            tracing::warn!("ACP stdout reader exited - connection closed");
         });
 
         let client = AcpClient {
@@ -166,12 +192,14 @@ impl AcpClient {
                 // Response not ready yet, wait for either response or timeout
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                    
+
                     // Check if response is ready
                     match rx.try_recv() {
                         Ok(val) => break val,
                         Err(oneshot::error::TryRecvError::Closed) => {
-                            return Err(anyhow!("acp response channel closed - the ACP process may have exited"));
+                            return Err(anyhow!(
+                                "acp response channel closed - the ACP process may have exited"
+                            ));
                         }
                         Err(oneshot::error::TryRecvError::Empty) => {
                             // Check timeout
@@ -184,10 +212,12 @@ impl AcpClient {
                 }
             }
             Err(oneshot::error::TryRecvError::Closed) => {
-                return Err(anyhow!("acp response channel closed - the ACP process may have exited"));
+                return Err(anyhow!(
+                    "acp response channel closed - the ACP process may have exited"
+                ));
             }
         };
-        
+
         result
     }
 
