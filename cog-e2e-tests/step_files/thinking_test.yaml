@@ -1,0 +1,23 @@
+session:
+  command: nvim
+  args: ["-u", "NONE", "--cmd", "set rtp+=/Volumes/External/code-external/cog/cog.nvim", "-c", "luafile /Volumes/External/code-external/cog/cog-e2e-tests/nvim_test_config/thinking_test_init.lua"]
+  cols: 120
+  rows: 40
+
+steps:
+  - waitForPattern: {pattern: "Thinking test loaded", timeoutMs: 10000}
+
+  - type: {text: ":lua require('cog.ui.split').focus_chat()"}
+  - press: {key: "Enter"}
+  - waitForPattern: {pattern: "You", timeoutMs: 5000}
+
+  - type: {text: "gg"}
+  - screenshot: {name: "thinking_block"}
+
+  - press: {key: "Escape"}
+  - type: {text: ":qa!"}
+  - press: {key: "Enter"}
+
+artifacts:
+  mode: always
+  dir: /Volumes/External/code-external/cog/cog-e2e-tests/test_artifacts/thinking_test
