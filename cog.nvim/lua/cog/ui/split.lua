@@ -13,6 +13,8 @@ local state = {
   session_info = {
     title = "New Chat",
     tokens = 0,
+    input_tokens = 0,
+    output_tokens = 0,
     model = "",
   },
   -- Spinner animation state
@@ -89,8 +91,19 @@ local function build_winbar()
   -- Right-aligned info
   table.insert(parts, "%=")
 
-  -- Token count (if available)
-  if state.session_info.tokens > 0 then
+  -- Token count (if available) - show input/output breakdown when available
+  local has_breakdown = state.session_info.input_tokens > 0 or state.session_info.output_tokens > 0
+  if has_breakdown then
+    local format_tokens = function(n)
+      if n >= 1000 then
+        return string.format("%.1fk", n / 1000)
+      end
+      return tostring(n)
+    end
+    local input_str = format_tokens(state.session_info.input_tokens)
+    local output_str = format_tokens(state.session_info.output_tokens)
+    table.insert(parts, "%#CogTokenCount#" .. input_str .. " / " .. output_str .. "%*")
+  elseif state.session_info.tokens > 0 then
     local tokens_str = state.session_info.tokens
     if tokens_str >= 1000 then
       tokens_str = string.format("%.1fk", tokens_str / 1000)
@@ -121,6 +134,12 @@ function M.set_session_info(info)
   end
   if info.tokens then
     state.session_info.tokens = info.tokens
+  end
+  if info.input_tokens then
+    state.session_info.input_tokens = info.input_tokens
+  end
+  if info.output_tokens then
+    state.session_info.output_tokens = info.output_tokens
   end
   if info.model then
     state.session_info.model = info.model
@@ -170,8 +189,26 @@ local function create_separator_buf()
   return buf
 end
 
+-- Calculate smart layout based on terminal dimensions
+local function calculate_smart_layout()
+  local cols = vim.o.columns
+  local lines = vim.o.lines
+  -- Use vsplit if terminal is wide enough (cols > lines * 2.5)
+  -- This ratio ensures the sidebar has enough room without being cramped
+  if cols > lines * 2.5 then
+    return "vsplit"
+  end
+  return "hsplit"
+end
+
 function M.open(layout_type, width, input_height)
   layout_type = layout_type or "vsplit"
+
+  -- Handle "smart" layout by calculating based on terminal size
+  if layout_type == "smart" then
+    layout_type = calculate_smart_layout()
+  end
+
   local cfg = config.get().ui.chat or {}
 
   -- Check if already open

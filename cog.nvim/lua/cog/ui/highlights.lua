@@ -91,6 +91,12 @@ function M.setup()
 
   -- Token count
   vim.api.nvim_set_hl(0, "CogTokenCount", { link = "Comment", default = true })
+
+  -- Inline buttons for permissions
+  vim.api.nvim_set_hl(0, "CogButton", { link = "Comment", default = true })
+  vim.api.nvim_set_hl(0, "CogButtonLabel", { link = "Normal", default = true })
+  vim.api.nvim_set_hl(0, "CogButtonFocused", { link = "Function", default = true })
+  vim.api.nvim_set_hl(0, "CogButtonLabelFocused", { bold = true, link = "Normal", default = true })
 end
 
 return M

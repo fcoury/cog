@@ -19,7 +19,7 @@ M.defaults = {
 	},
 	ui = {
 		chat = {
-			-- Layout type: "popup" (floating), "vsplit" (vertical split sidebar), "hsplit" (horizontal split panel)
+			-- Layout type: "popup" (floating), "vsplit" (vertical split sidebar), "hsplit" (horizontal split panel), "smart" (auto-choose based on terminal size)
 			layout = "vsplit",
 			position = "right",
 			width = "40%",

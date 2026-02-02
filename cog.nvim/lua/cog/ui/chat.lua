@@ -37,7 +37,487 @@ local state = {
   },
   -- Token tracking for messages
   current_message_tokens = 0,
+  -- Smart auto-scroll state: tracks if user has scrolled up from bottom
+  user_scrolled_up = false,
+  -- Code block tracking for inline hints
+  code_blocks = {},
+  -- Current code block hint extmark ID (for clearing)
+  code_hint_extmark = nil,
 }
+
+-- Smart auto-scroll: check if user is near bottom of chat window
+local function should_auto_scroll()
+  local chat_win = nil
+  local chat_buf = nil
+
+  if state.layout_type == "popup" then
+    if state.messages and state.messages.winid and vim.api.nvim_win_is_valid(state.messages.winid) then
+      chat_win = state.messages.winid
+      chat_buf = state.messages.bufnr
+    end
+  else
+    chat_win = split.get_chat_win()
+    chat_buf = split.get_chat_buf()
+  end
+
+  if not chat_win or not vim.api.nvim_win_is_valid(chat_win) then
+    return true -- Default to auto-scroll if we can't check
+  end
+
+  -- If user has explicitly scrolled up, don't auto-scroll
+  if state.user_scrolled_up then
+    return false
+  end
+
+  -- Check if cursor is near the bottom
+  local cursor_line = vim.api.nvim_win_get_cursor(chat_win)[1]
+  local total_lines = vim.api.nvim_buf_line_count(chat_buf)
+  local win_height = vim.api.nvim_win_get_height(chat_win)
+
+  -- Auto-scroll if within one screen height of the bottom
+  return cursor_line >= total_lines - win_height
+end
+
+-- Setup scroll tracking keymaps for a chat buffer
+local function setup_scroll_tracking(bufnr)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  -- j/k: Mark as scrolled up (user is navigating)
+  vim.keymap.set("n", "j", function()
+    state.user_scrolled_up = true
+    return "j"
+  end, { buffer = bufnr, expr = true, silent = true })
+
+  vim.keymap.set("n", "k", function()
+    state.user_scrolled_up = true
+    return "k"
+  end, { buffer = bufnr, expr = true, silent = true })
+
+  -- Ctrl-d/Ctrl-u: Mark as scrolled up (user is scrolling)
+  vim.keymap.set("n", "<C-d>", function()
+    state.user_scrolled_up = true
+    return "<C-d>"
+  end, { buffer = bufnr, expr = true, silent = true })
+
+  vim.keymap.set("n", "<C-u>", function()
+    state.user_scrolled_up = true
+    return "<C-u>"
+  end, { buffer = bufnr, expr = true, silent = true })
+
+  -- G: Jump to bottom, resume auto-scroll
+  vim.keymap.set("n", "G", function()
+    state.user_scrolled_up = false
+    return "G"
+  end, { buffer = bufnr, expr = true, silent = true })
+
+  -- gg: Jump to top, mark as scrolled up
+  vim.keymap.set("n", "gg", function()
+    state.user_scrolled_up = true
+    return "gg"
+  end, { buffer = bufnr, expr = true, silent = true })
+end
+
+-- Code block hints namespace
+local code_hint_ns = vim.api.nvim_create_namespace("cog_code_hints")
+
+-- User message hints namespace
+local user_hint_ns = vim.api.nvim_create_namespace("cog_user_hints")
+
+-- Tool block hints namespace
+local tool_hint_ns = vim.api.nvim_create_namespace("cog_tool_hints")
+
+-- Forward declarations for functions defined later
+local show_all_hints
+local clear_user_message_hints
+local clear_tool_hints
+
+-- Debounce timer for CursorMoved
+local cursor_debounce_timer = nil
+
+-- Find code block containing the given line
+local function find_code_block_at_line(bufnr, line)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local in_code_block = false
+  local code_start = nil
+  local code_lang = nil
+
+  for i, content in ipairs(lines) do
+    local line_num = i - 1 -- 0-indexed
+    -- Check for code block start (```language)
+    local lang_match = content:match("^```(%w*)")
+    if lang_match then
+      if not in_code_block then
+        in_code_block = true
+        code_start = line_num
+        code_lang = lang_match ~= "" and lang_match or nil
+      else
+        -- End of code block
+        if line >= code_start and line <= line_num then
+          return {
+            start_line = code_start,
+            end_line = line_num,
+            language = code_lang,
+          }
+        end
+        in_code_block = false
+        code_start = nil
+        code_lang = nil
+      end
+    end
+  end
+
+  return nil
+end
+
+-- Get code block content (without the ``` markers)
+local function get_code_block_content(bufnr, block)
+  if not block then
+    return nil
+  end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, block.start_line + 1, block.end_line, false)
+  return table.concat(lines, "\n")
+end
+
+-- Show action hints for code block
+local function show_code_block_hints(bufnr, line)
+  -- Clear previous hint
+  vim.api.nvim_buf_clear_namespace(bufnr, code_hint_ns, 0, -1)
+
+  local block = find_code_block_at_line(bufnr, line)
+  if not block then
+    return
+  end
+
+  -- Don't show hints on the ``` delimiter lines themselves
+  if line == block.start_line or line == block.end_line then
+    return
+  end
+
+  -- Show hint on the current line
+  pcall(vim.api.nvim_buf_set_extmark, bufnr, code_hint_ns, line, 0, {
+    virt_text = { { "[a: apply] [y: copy]", "Comment" } },
+    virt_text_pos = "right_align",
+    hl_mode = "combine",
+    priority = 100,
+  })
+end
+
+-- Clear code block hints
+local function clear_code_block_hints(bufnr)
+  if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+    vim.api.nvim_buf_clear_namespace(bufnr, code_hint_ns, 0, -1)
+  end
+end
+
+-- Setup CursorMoved autocmd for code block hints (debounced)
+local function setup_code_block_hints(bufnr)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  -- Create autocmd for cursor movement
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    buffer = bufnr,
+    callback = function()
+      -- Debounce: clear existing timer and set new one
+      if cursor_debounce_timer then
+        vim.fn.timer_stop(cursor_debounce_timer)
+      end
+
+      cursor_debounce_timer = vim.fn.timer_start(50, function()
+        vim.schedule(function()
+          if not vim.api.nvim_buf_is_valid(bufnr) then
+            return
+          end
+          local cursor = vim.api.nvim_win_get_cursor(0)
+          local line = cursor[1] - 1 -- 0-indexed
+          show_all_hints(bufnr, line)
+        end)
+      end)
+    end,
+  })
+
+  -- Clear hints when leaving the buffer
+  vim.api.nvim_create_autocmd("BufLeave", {
+    buffer = bufnr,
+    callback = function()
+      clear_code_block_hints(bufnr)
+      clear_user_message_hints(bufnr)
+      clear_tool_hints(bufnr)
+    end,
+  })
+
+  -- Setup keymaps for code block actions
+  -- 'a' - Apply code block
+  vim.keymap.set("n", "a", function()
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local line = cursor[1] - 1
+    local block = find_code_block_at_line(bufnr, line)
+    if block then
+      local content = get_code_block_content(bufnr, block)
+      if content then
+        -- Get the buffer to apply to (the previous buffer before chat was opened)
+        local target_buf = vim.fn.bufnr("#")
+        if target_buf ~= -1 and vim.api.nvim_buf_is_valid(target_buf) then
+          -- For now, just yank to register and notify
+          vim.fn.setreg('"', content)
+          vim.fn.setreg('+', content)
+          vim.notify("Code copied to clipboard. Use 'p' to paste in target buffer.", vim.log.levels.INFO)
+        else
+          vim.fn.setreg('"', content)
+          vim.fn.setreg('+', content)
+          vim.notify("Code copied to clipboard", vim.log.levels.INFO)
+        end
+      end
+    end
+  end, { buffer = bufnr, silent = true, desc = "Apply code block" })
+
+  -- 'y' - Copy code block to clipboard
+  vim.keymap.set("n", "y", function()
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local line = cursor[1] - 1
+    local block = find_code_block_at_line(bufnr, line)
+    if block then
+      local content = get_code_block_content(bufnr, block)
+      if content then
+        vim.fn.setreg('"', content)
+        vim.fn.setreg('+', content)
+        vim.notify("Code block copied to clipboard", vim.log.levels.INFO)
+      end
+    else
+      -- Fall back to default yank behavior
+      return "y"
+    end
+  end, { buffer = bufnr, silent = true, expr = false, desc = "Copy code block" })
+end
+
+-- Find user message block containing the given line
+local function find_user_block_at_line(line)
+  for i, block in ipairs(state.message_blocks) do
+    if block.role == "user" and line >= block.header_line and line <= block.content_end then
+      return block, i
+    end
+  end
+  return nil, nil
+end
+
+-- Get the content of a user message block
+local function get_user_block_content(bufnr, block)
+  if not block then
+    return nil
+  end
+  local cfg = config.get().ui.chat or {}
+  local show_borders = cfg.show_borders == true
+  local lines = vim.api.nvim_buf_get_lines(bufnr, block.content_start, block.content_end + 1, false)
+
+  -- Strip border prefixes if enabled
+  if show_borders then
+    local result = {}
+    for _, l in ipairs(lines) do
+      -- Remove border character and space (e.g., "┃ ")
+      local stripped = l:gsub("^[┃│┊] ", "")
+      table.insert(result, stripped)
+    end
+    return table.concat(result, "\n")
+  end
+
+  return table.concat(lines, "\n")
+end
+
+-- Show action hints for user message block
+local function show_user_message_hints(bufnr, line)
+  -- Clear previous hint
+  vim.api.nvim_buf_clear_namespace(bufnr, user_hint_ns, 0, -1)
+
+  local block, _ = find_user_block_at_line(line)
+  if not block then
+    return false
+  end
+
+  -- Show hint on the header line of the user block
+  pcall(vim.api.nvim_buf_set_extmark, bufnr, user_hint_ns, block.header_line, 0, {
+    virt_text = { { "[r: retry] [e: edit]", "Comment" } },
+    virt_text_pos = "right_align",
+    hl_mode = "combine",
+    priority = 100,
+  })
+
+  return true
+end
+
+-- Clear user message hints
+clear_user_message_hints = function(bufnr)
+  if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+    vim.api.nvim_buf_clear_namespace(bufnr, user_hint_ns, 0, -1)
+  end
+end
+
+-- Setup user message action keymaps
+local function setup_user_message_hints(bufnr)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  -- 'r' - Retry: resend the same prompt
+  vim.keymap.set("n", "r", function()
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local line = cursor[1] - 1
+    local block, _ = find_user_block_at_line(line)
+    if block then
+      local content = get_user_block_content(bufnr, block)
+      if content and content ~= "" then
+        -- Resend the prompt
+        require("cog.session").prompt(content)
+        vim.notify("Retrying prompt...", vim.log.levels.INFO)
+      end
+    end
+  end, { buffer = bufnr, silent = true, desc = "Retry user message" })
+
+  -- 'e' - Edit: copy to input and delete original (or just copy for safety)
+  vim.keymap.set("n", "e", function()
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local line = cursor[1] - 1
+    local block, _ = find_user_block_at_line(line)
+    if block then
+      local content = get_user_block_content(bufnr, block)
+      if content and content ~= "" then
+        -- Copy content to input buffer
+        local input_buf = split.get_input_buf()
+        if input_buf and vim.api.nvim_buf_is_valid(input_buf) then
+          local lines = vim.split(content, "\n", { plain = true })
+          vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, lines)
+          -- Focus input window
+          split.focus_input()
+          vim.notify("Message copied to input for editing", vim.log.levels.INFO)
+        end
+      end
+    end
+  end, { buffer = bufnr, silent = true, desc = "Edit user message" })
+
+  -- Also update the CursorMoved to show user hints
+  -- This is handled in the existing code block hints autocmd
+end
+
+-- Find tool block containing the given line
+local function find_tool_block_at_line(line)
+  for i, block in ipairs(state.message_blocks) do
+    if block.role == "tool" and line >= block.header_line and line <= block.content_end then
+      return block, i
+    end
+  end
+  return nil, nil
+end
+
+-- Show action hints for tool block (collapse/expand)
+local function show_tool_hints(bufnr, line)
+  -- Clear previous hint
+  vim.api.nvim_buf_clear_namespace(bufnr, tool_hint_ns, 0, -1)
+
+  local block, _ = find_tool_block_at_line(line)
+  if not block then
+    return false
+  end
+
+  -- Only show hint if there's more than one line (something to collapse)
+  if block.content_end <= block.content_start then
+    return false
+  end
+
+  -- Show hint on the first line of the tool block
+  pcall(vim.api.nvim_buf_set_extmark, bufnr, tool_hint_ns, block.header_line, 0, {
+    virt_text = { { "[Tab: toggle] [za: fold]", "Comment" } },
+    virt_text_pos = "right_align",
+    hl_mode = "combine",
+    priority = 100,
+  })
+
+  return true
+end
+
+-- Clear tool hints
+clear_tool_hints = function(bufnr)
+  if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+    vim.api.nvim_buf_clear_namespace(bufnr, tool_hint_ns, 0, -1)
+  end
+end
+
+-- Setup tool block collapse/expand keymaps
+local function setup_tool_block_hints(bufnr)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  -- Tab - Toggle tool block fold
+  vim.keymap.set("n", "<Tab>", function()
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local line = cursor[1] -- 1-indexed for fold commands
+    local block, _ = find_tool_block_at_line(line - 1) -- 0-indexed for our block tracking
+
+    if block then
+      -- Check if there's a fold at this line
+      local foldclosed = vim.fn.foldclosed(line)
+      if foldclosed ~= -1 then
+        -- Fold is closed, open it
+        vim.cmd(line .. "foldopen")
+      else
+        -- Check if we're in a fold that can be closed
+        local foldlevel = vim.fn.foldlevel(line)
+        if foldlevel > 0 then
+          vim.cmd(line .. "foldclose")
+        else
+          -- No existing fold, try to create one for the tool content
+          -- Fold from content_start+1 to content_end (skip header)
+          if block.content_end > block.content_start then
+            local fold_start = block.content_start + 2 -- 1-indexed, skip first line
+            local fold_end = block.content_end + 1 -- 1-indexed
+            if fold_end > fold_start then
+              pcall(vim.cmd, fold_start .. "," .. fold_end .. "fold")
+              pcall(vim.cmd, fold_start .. "foldclose")
+            end
+          end
+        end
+      end
+    else
+      -- Not in a tool block, fall back to default Tab behavior
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "n", false)
+    end
+  end, { buffer = bufnr, silent = true, desc = "Toggle tool block fold" })
+end
+
+-- Combined hint display function (code blocks + user messages + tool blocks)
+show_all_hints = function(bufnr, line)
+  -- Try code block hints first
+  show_code_block_hints(bufnr, line)
+
+  -- Check if in code block
+  local code_block = find_code_block_at_line(bufnr, line)
+  if code_block and line ~= code_block.start_line and line ~= code_block.end_line then
+    -- In a code block, clear other hints
+    clear_user_message_hints(bufnr)
+    clear_tool_hints(bufnr)
+    return
+  end
+
+  -- Try user message hints
+  local user_shown = show_user_message_hints(bufnr, line)
+
+  -- Try tool hints
+  local tool_shown = show_tool_hints(bufnr, line)
+
+  -- Clear hints that weren't shown
+  if not user_shown then
+    clear_user_message_hints(bufnr)
+  end
+  if not tool_shown then
+    clear_tool_hints(bufnr)
+  end
+end
 
 -- Message border characters
 local BORDER = {
@@ -427,13 +907,29 @@ local function popup_buf_valid(popup)
   return popup and popup.bufnr and vim.api.nvim_buf_is_valid(popup.bufnr)
 end
 
+-- Calculate smart layout based on terminal dimensions
+local function calculate_smart_layout()
+  local cols = vim.o.columns
+  local lines = vim.o.lines
+  -- Use vsplit if terminal is wide enough (cols > lines * 2.5)
+  if cols > lines * 2.5 then
+    return "vsplit"
+  end
+  return "hsplit"
+end
+
 function M.open()
   local cfg = config.get().ui.chat
   local layout_type = cfg.layout or "popup"
-  
+
+  -- Handle "smart" layout by calculating based on terminal size
+  if layout_type == "smart" then
+    layout_type = calculate_smart_layout()
+  end
+
   -- Store layout type for later use
   state.layout_type = layout_type
-  
+
   if layout_type == "popup" and nui_ok and layout_ok then
     -- Use nui.nvim popup layout
     if state.layout then
@@ -493,6 +989,10 @@ function M.open()
     layout:mount()
 
     setup_input_keymaps(state.input)
+    setup_scroll_tracking(state.messages.bufnr)
+    setup_code_block_hints(state.messages.bufnr)
+    setup_user_message_hints(state.messages.bufnr)
+    setup_tool_block_hints(state.messages.bufnr)
     if vim.fn.exists(":RenderMarkdown") == 2 then
       vim.api.nvim_buf_call(state.messages.bufnr, function()
         vim.cmd("RenderMarkdown")
@@ -505,19 +1005,31 @@ function M.open()
     
     if chat_buf and input_buf then
       state.bufnr = chat_buf
-      
+
       -- Setup input keymaps for split
       local input_win = split.get_input_win()
       if input_win then
         -- Map <CR> to send in input buffer
-        vim.api.nvim_buf_set_keymap(input_buf, "i", "<CR>", 
+        vim.api.nvim_buf_set_keymap(input_buf, "i", "<CR>",
           "<cmd>lua require('cog.ui.chat').send_input()<cr>",
           { noremap = true, silent = true })
-        vim.api.nvim_buf_set_keymap(input_buf, "n", "<CR>", 
+        vim.api.nvim_buf_set_keymap(input_buf, "n", "<CR>",
           "<cmd>lua require('cog.ui.chat').send_input()<cr>",
           { noremap = true, silent = true })
       end
-      
+
+      -- Setup scroll tracking for chat buffer
+      setup_scroll_tracking(chat_buf)
+
+      -- Setup code block hints
+      setup_code_block_hints(chat_buf)
+
+      -- Setup user message hints
+      setup_user_message_hints(chat_buf)
+
+      -- Setup tool block hints
+      setup_tool_block_hints(chat_buf)
+
       if vim.fn.exists(":RenderMarkdown") == 2 then
         vim.api.nvim_buf_call(chat_buf, function()
           vim.cmd("RenderMarkdown")
@@ -689,13 +1201,15 @@ function M.append(role, text)
   state.last_role = role
   state.last_line = content_end + 1
 
-  -- Scroll to bottom
-  if state.layout_type == "popup" then
-    if state.messages and state.messages.winid then
-      vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(bufnr), 0 })
+  -- Scroll to bottom only if user hasn't scrolled up
+  if should_auto_scroll() then
+    if state.layout_type == "popup" then
+      if state.messages and state.messages.winid then
+        vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(bufnr), 0 })
+      end
+    else
+      split.scroll_to_bottom()
     end
-  else
-    split.scroll_to_bottom()
   end
 
   return {
@@ -787,13 +1301,15 @@ local function append_stream_text(role, text)
 
   reset_stream_timer()
 
-  -- Scroll to bottom
-  if state.layout_type == "popup" then
-    if state.messages and state.messages.winid then
-      vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(bufnr), 0 })
+  -- Scroll to bottom only if user hasn't scrolled up
+  if should_auto_scroll() then
+    if state.layout_type == "popup" then
+      if state.messages and state.messages.winid then
+        vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(bufnr), 0 })
+      end
+    else
+      split.scroll_to_bottom()
     end
-  else
-    split.scroll_to_bottom()
   end
 end
 
@@ -1284,13 +1800,15 @@ function M.upsert_tool_call(tool_call_id, tool_data)
       end
     end
 
-    -- Scroll to bottom
-    if state.layout_type == "popup" then
-      if state.messages and state.messages.winid then
-        vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(get_message_buf()), 0 })
+    -- Scroll to bottom only if user hasn't scrolled up
+    if should_auto_scroll() then
+      if state.layout_type == "popup" then
+        if state.messages and state.messages.winid then
+          vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(get_message_buf()), 0 })
+        end
+      else
+        split.scroll_to_bottom()
       end
-    else
-      split.scroll_to_bottom()
     end
     return
   end
@@ -1386,13 +1904,15 @@ function M.upsert_tool_call(tool_call_id, tool_data)
     state.last_role = "tool"
   end
 
-  -- Scroll to bottom
-  if state.layout_type == "popup" then
-    if state.messages and state.messages.winid then
-      vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(bufnr), 0 })
+  -- Scroll to bottom only if user hasn't scrolled up
+  if should_auto_scroll() then
+    if state.layout_type == "popup" then
+      if state.messages and state.messages.winid then
+        vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(bufnr), 0 })
+      end
+    else
+      split.scroll_to_bottom()
     end
-  else
-    split.scroll_to_bottom()
   end
 end
 
@@ -1440,13 +1960,15 @@ function M.append_chunk(role, text)
     state.last_line = state.last_line + #extra
   end
 
-  -- Scroll to bottom
-  if state.layout_type == "popup" then
-    if state.messages and state.messages.winid then
-      vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(bufnr), 0 })
+  -- Scroll to bottom only if user hasn't scrolled up
+  if should_auto_scroll() then
+    if state.layout_type == "popup" then
+      if state.messages and state.messages.winid then
+        vim.api.nvim_win_set_cursor(state.messages.winid, { vim.api.nvim_buf_line_count(bufnr), 0 })
+      end
+    else
+      split.scroll_to_bottom()
     end
-  else
-    split.scroll_to_bottom()
   end
 end
 
@@ -1592,6 +2114,9 @@ function M.reset()
   state.message_blocks = {}
   state.tool_calls = {}
   state.current_message_tokens = 0
+  state.user_scrolled_up = false -- Re-enable auto-scroll for new conversation
+  state.code_blocks = {}
+  state.code_hint_extmark = nil
 
   -- Clear fold ranges
   fold_ranges = {}

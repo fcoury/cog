@@ -731,10 +731,15 @@ function M.handle_event(event, payload)
     -- Handle usage/token updates
     if update_type == "usage" or update_type == "usage_update" then
       local usage = update.usage or payload.usage or update
-      local total_tokens = usage.total_tokens or usage.totalTokens
-        or ((usage.input_tokens or usage.inputTokens or 0) + (usage.output_tokens or usage.outputTokens or 0))
+      local input_tokens = usage.input_tokens or usage.inputTokens or 0
+      local output_tokens = usage.output_tokens or usage.outputTokens or 0
+      local total_tokens = usage.total_tokens or usage.totalTokens or (input_tokens + output_tokens)
       if total_tokens and total_tokens > 0 then
-        require("cog.ui.split").set_session_info({ tokens = total_tokens })
+        require("cog.ui.split").set_session_info({
+          tokens = total_tokens,
+          input_tokens = input_tokens,
+          output_tokens = output_tokens,
+        })
       end
       return
     end
