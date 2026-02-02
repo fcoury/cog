@@ -35,6 +35,8 @@ local state = {
     idle_timer = nil,
     kind = nil,
   },
+  -- Token tracking for messages
+  current_message_tokens = 0,
 }
 
 -- Message border characters
@@ -44,6 +46,65 @@ local BORDER = {
   system = "┊",
 }
 
+-- Track fold ranges for tool output
+local fold_ranges = {}
+
+-- Custom foldtext function for tool output folds
+-- Returns a function that can be used as foldtext
+_G.CogFoldText = function()
+  local line_count = vim.v.foldend - vim.v.foldstart + 1
+  -- Get the border character from the first folded line to preserve card structure
+  local first_line = vim.fn.getline(vim.v.foldstart)
+  local border_prefix = first_line:match("^(│[│┃]?)") or "││"
+  return string.format("%s  ▸ %d more lines (za to toggle)", border_prefix, line_count)
+end
+
+-- Setup fold settings for a window displaying the chat buffer
+local function setup_fold_settings(winid)
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+  vim.api.nvim_win_call(winid, function()
+    vim.opt_local.foldmethod = "manual"
+    vim.opt_local.foldenable = true
+    vim.opt_local.foldlevel = 0 -- Start with all folds closed
+    vim.opt_local.foldminlines = 1
+    vim.opt_local.foldtext = "v:lua.CogFoldText()"
+  end)
+end
+
+-- Create a fold for tool output and close it
+local function create_tool_fold(bufnr, start_line, end_line, hidden_count)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  -- Store fold range for later recreation if needed
+  table.insert(fold_ranges, {
+    bufnr = bufnr,
+    start_line = start_line,
+    end_line = end_line,
+    hidden_count = hidden_count,
+  })
+
+  -- Find the window displaying this buffer
+  local chat_win = split.get_chat_win()
+  if chat_win and vim.api.nvim_win_is_valid(chat_win) then
+    -- Ensure fold settings are applied to the window
+    setup_fold_settings(chat_win)
+
+    -- Create fold in the context of the chat window
+    vim.api.nvim_win_call(chat_win, function()
+      -- Create fold from start_line to end_line (1-indexed for vim commands)
+      local ok, err = pcall(vim.cmd, string.format("%d,%dfold", start_line + 1, end_line + 1))
+      if ok then
+        -- Close the fold so it starts collapsed
+        pcall(vim.cmd, string.format("%dfoldclose", start_line + 1))
+      end
+    end)
+  end
+end
+
 local function ensure_buffer()
   if state.bufnr and vim.api.nvim_buf_is_valid(state.bufnr) then
     return state.bufnr
@@ -52,6 +113,7 @@ local function ensure_buffer()
   state.bufnr = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_option(state.bufnr, "filetype", "markdown")
   vim.api.nvim_buf_set_option(state.bufnr, "bufhidden", "hide")
+
   return state.bufnr
 end
 
@@ -89,7 +151,7 @@ end
 -- Get role header with icon
 local function get_role_header(role)
   local cfg = config.get().ui.chat or {}
-  local icons = {
+  local role_icons = {
     user = cfg.user_icon or "●",
     assistant = cfg.assistant_icon or "◆",
     system = "○",
@@ -99,9 +161,43 @@ local function get_role_header(role)
     assistant = "Assistant",
     system = "System",
   }
-  local icon = icons[role] or icons.system
+  local icon = role_icons[role] or role_icons.system
   local name = names[role] or "Cog"
   return icon .. " " .. name
+end
+
+-- Get the width of the chat window
+local function get_chat_width()
+  if state.layout_type == "popup" then
+    if state.messages and state.messages.winid and vim.api.nvim_win_is_valid(state.messages.winid) then
+      return vim.api.nvim_win_get_width(state.messages.winid)
+    end
+  else
+    local win = split.get_chat_win()
+    if win and vim.api.nvim_win_is_valid(win) then
+      return vim.api.nvim_win_get_width(win)
+    end
+  end
+  return 80 -- fallback
+end
+
+-- Add separator line after header using virtual text
+local function add_header_separator(bufnr, line, header_text, role)
+  local ns = vim.api.nvim_create_namespace("cog_chat_styling")
+  local width = get_chat_width()
+  local header_width = vim.fn.strdisplaywidth(header_text)
+  local separator_char = "─"
+  local separator_len = math.max(0, width - header_width - 2) -- -2 for space before separator
+
+  if separator_len > 0 then
+    local separator = " " .. string.rep(separator_char, separator_len)
+    local sep_hl = "CogSeparator"
+    pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line, #header_text, {
+      virt_text = { { separator, sep_hl } },
+      virt_text_pos = "overlay",
+      priority = 15,
+    })
+  end
 end
 
 -- Apply extmarks for message styling
@@ -425,6 +521,67 @@ function M.open()
   end
 end
 
+-- Apply styled thinking header with separator (moved here for forward reference)
+local function render_thinking_header(bufnr, line)
+  local ns = vim.api.nvim_create_namespace("cog_thinking")
+  local thinking_icon = icons.tool_icons.thinking or "󰠗"
+  local width = get_chat_width()
+  local header_text = thinking_icon .. " Thinking"
+  local header_width = vim.fn.strdisplaywidth(header_text)
+  local separator_len = math.max(0, width - header_width - 4) -- -4 for border + spaces
+
+  local separator = " " .. string.rep("─", separator_len)
+
+  -- Set extmark for the styled header
+  pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line, 0, {
+    end_row = line,
+    end_col = 0,
+    line_hl_group = "CogThinkingHeader",
+    priority = 15,
+  })
+
+  -- Add separator as virtual text
+  pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line, #header_text + 2, {
+    virt_text = { { separator, "CogSeparator" } },
+    virt_text_pos = "overlay",
+    priority = 16,
+  })
+end
+
+-- Process thinking tags in text, returns processed lines and thinking region info
+local function process_thinking_tags(lines)
+  local result = {}
+  local thinking_regions = {} -- {start_line, end_line} pairs for styling
+  local in_thinking = false
+  local thinking_start = nil
+  local thinking_icon = icons.tool_icons.thinking or "󰠗"
+
+  for i, line in ipairs(lines) do
+    -- Check for <thinking> tag (with or without closing >)
+    if line:match("^%s*<thinking>?%s*$") then
+      in_thinking = true
+      thinking_start = #result + 1
+      -- Replace with styled header
+      table.insert(result, thinking_icon .. " Thinking")
+    -- Check for </thinking> tag
+    elseif line:match("^%s*</thinking>%s*$") then
+      if in_thinking and thinking_start then
+        table.insert(thinking_regions, {
+          start_line = thinking_start,
+          end_line = #result,
+        })
+      end
+      in_thinking = false
+      thinking_start = nil
+      -- Don't add the closing tag - just end the block
+    else
+      table.insert(result, line)
+    end
+  end
+
+  return result, thinking_regions
+end
+
 function M.append(role, text)
   local bufnr = get_message_buf()
   local cfg = config.get().ui.chat or {}
@@ -435,6 +592,10 @@ function M.append(role, text)
 
   -- Parse text into lines
   local raw_lines = split_lines(text)
+
+  -- Process thinking tags if present
+  local processed_lines, thinking_regions = process_thinking_tags(raw_lines)
+  raw_lines = processed_lines
 
   local existing = vim.api.nvim_buf_line_count(bufnr)
   local message_padding = cfg.message_padding or 1
@@ -478,8 +639,34 @@ function M.append(role, text)
     priority = 10,
   })
 
+  -- Add separator line after header
+  add_header_separator(bufnr, header_line, header, role)
+
   -- Apply content styling
   apply_message_styling(bufnr, role, content_start, content_end)
+
+  -- Apply thinking region styling
+  if #thinking_regions > 0 then
+    local thinking_ns = vim.api.nvim_create_namespace("cog_thinking")
+    for _, region in ipairs(thinking_regions) do
+      -- Adjust line numbers to buffer positions (account for border prefix in formatted lines)
+      local header_buf_line = content_start + region.start_line - 1
+      local end_buf_line = content_start + region.end_line - 1
+
+      -- Style the thinking header line
+      render_thinking_header(bufnr, header_buf_line)
+
+      -- Apply dimmed styling to thinking content
+      for line_idx = header_buf_line + 1, end_buf_line do
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, thinking_ns, line_idx, 0, {
+          end_row = line_idx,
+          end_col = 0,
+          line_hl_group = "CogThinkingContent",
+          priority = 12,
+        })
+      end
+    end
+  end
 
   -- Track message block
   table.insert(state.message_blocks, {
@@ -602,14 +789,29 @@ end
 
 local function close_thought_block()
   if state.stream.kind == "thought" then
-    append_stream_text(state.stream.role or "assistant", "\n</thinking>\n")
+    -- Use a visual end instead of raw tag
+    append_stream_text(state.stream.role or "assistant", "\n")
     state.stream.kind = "message"
   end
 end
 
 local function open_thought_block()
   if state.stream.kind ~= "thought" then
-    append_stream_text(state.stream.role or "assistant", "\n<thinking>\n")
+    -- Render styled thinking header instead of raw <thinking> tag
+    local thinking_icon = icons.tool_icons.thinking or "󰠗"
+    local header_text = thinking_icon .. " Thinking"
+    append_stream_text(state.stream.role or "assistant", "\n" .. header_text .. "\n")
+
+    -- Apply styling to the header line
+    local bufnr = get_message_buf()
+    if state.stream.anchor_line and bufnr then
+      -- The header is at anchor_line - 1 (we just appended two lines: header and content start)
+      local header_line = state.stream.anchor_line - 1
+      if header_line >= 0 then
+        render_thinking_header(bufnr, header_line)
+      end
+    end
+
     state.stream.kind = "thought"
   end
 end
@@ -628,17 +830,64 @@ function M.append_stream_chunk(role, text, kind)
   append_stream_text(role, text)
 end
 
-function M.end_stream()
+-- Display token count as virtual text at end of message block
+local function display_token_count(tokens, block_index)
+  if not tokens or tokens <= 0 then
+    return
+  end
+
+  local bufnr = get_message_buf()
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local block = state.message_blocks[block_index]
+  if not block then
+    return
+  end
+
+  local ns = vim.api.nvim_create_namespace("cog_token_count")
+  local line = block.content_end
+
+  -- Format token count
+  local token_str
+  if tokens >= 1000 then
+    token_str = string.format("%.1fk tokens", tokens / 1000)
+  else
+    token_str = string.format("%d tokens", tokens)
+  end
+
+  -- Add virtual text at end of line
+  pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line, 0, {
+    virt_text = { { "[" .. token_str .. "]", "CogTokenCount" } },
+    virt_text_pos = "eol",
+    priority = 50,
+  })
+end
+
+function M.end_stream(tokens)
   if not state.stream.active then
     return
   end
   close_thought_block()
   clear_stream_timer()
+
+  -- Display token count if provided
+  if tokens and tokens > 0 and state.stream.block_index then
+    display_token_count(tokens, state.stream.block_index)
+  end
+
   state.stream.active = false
   state.stream.role = nil
   state.stream.anchor_line = nil
   state.stream.block_index = nil
   state.stream.kind = nil
+  state.current_message_tokens = 0
+end
+
+-- Set token count for current message (can be called during streaming)
+function M.set_message_tokens(tokens)
+  state.current_message_tokens = tokens or 0
 end
 
 -- Tool card rendering helpers
@@ -680,6 +929,26 @@ local function get_tool_icon_hl(kind)
   return "CogToolIcon"
 end
 
+-- Returns all lines plus fold info if content exceeds max_lines
+-- Foldtext will display our custom indicator when the fold is closed
+-- Returns: lines, fold_info (start line index, end line index, hidden count)
+local function prepare_foldable_lines(lines, max_lines)
+  if not lines or #lines <= max_lines then
+    return lines, nil
+  end
+
+  -- Return all lines - the fold mechanism will hide the excess
+  local hidden_count = #lines - max_lines + 1
+  local fold_start = max_lines - 1 -- 0-indexed, first line to be folded
+
+  return lines, {
+    fold_start = fold_start,
+    fold_end = #lines - 1,
+    hidden_count = hidden_count,
+  }
+end
+
+-- Legacy function for backward compatibility
 local function truncate_lines(lines, max_lines)
   if not lines or #lines <= max_lines then
     return lines, false
@@ -788,15 +1057,29 @@ local function render_tool_card_lines(tool_data)
     table.insert(content_lines, "...")
   end
 
-  -- Truncate and add content lines with left border only
+  -- Track fold information
+  local fold_info = nil
+  local content_start_in_card = #lines -- Index where content starts (after header)
+
+  -- Prepare foldable content if needed
   if #content_lines > 0 then
-    local truncated, was_truncated = truncate_lines(content_lines, max_preview)
-    for _, content_line in ipairs(truncated) do
+    local prepared_lines, fold_data = prepare_foldable_lines(content_lines, max_preview)
+    for _, content_line in ipairs(prepared_lines) do
       -- Truncate long lines
       if #content_line > card_width - 4 then
         content_line = content_line:sub(1, card_width - 7) .. "..."
       end
       table.insert(lines, border.left .. "  " .. content_line)
+    end
+
+    -- Convert fold info to absolute positions within card
+    if fold_data then
+      fold_info = {
+        -- fold_start is relative to content, convert to relative to card lines
+        fold_start = content_start_in_card + fold_data.fold_start,
+        fold_end = content_start_in_card + fold_data.fold_end,
+        hidden_count = fold_data.hidden_count,
+      }
     end
   end
 
@@ -804,7 +1087,7 @@ local function render_tool_card_lines(tool_data)
   local bottom_fill = string.rep(border.bottom, card_width + 1)
   table.insert(lines, border.bottom_left .. bottom_fill .. border.bottom_right)
 
-  return lines
+  return lines, fold_info
 end
 
 local function apply_tool_card_highlights(bufnr, start_line, lines, status, kind)
@@ -875,6 +1158,45 @@ local function apply_tool_card_highlights(bufnr, start_line, lines, status, kind
         })
       end
     end
+
+    -- Diff highlighting - detect diff content in tool card lines
+    -- Strip border characters first to get content
+    local content = line:gsub("^[│╎]%s*", "")
+
+    -- Hunk headers (@@ ... @@)
+    if content:match("^@@.*@@") then
+      local content_start = line:find("@@")
+      if content_start then
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, content_start - 1, {
+          end_row = line_idx,
+          end_col = #line,
+          hl_group = "CogDiffHunk",
+          priority = 30,
+        })
+      end
+    -- Added lines (+...)
+    elseif content:match("^%+[^%+]") or content:match("^%+$") then
+      local content_start = line:find("%+")
+      if content_start then
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, content_start - 1, {
+          end_row = line_idx,
+          end_col = #line,
+          hl_group = "CogDiffAdd",
+          priority = 30,
+        })
+      end
+    -- Deleted lines (-...)
+    elseif content:match("^%-[^%-]") or content:match("^%-$") then
+      local content_start = line:find("%-")
+      if content_start then
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line_idx, content_start - 1, {
+          end_row = line_idx,
+          end_col = #line,
+          hl_group = "CogDiffDelete",
+          priority = 30,
+        })
+      end
+    end
   end
 end
 
@@ -936,7 +1258,7 @@ function M.upsert_tool_call(tool_call_id, tool_data)
   end
 
   -- Card style rendering
-  local card_lines = render_tool_card_lines(tool_data)
+  local card_lines, fold_info = render_tool_card_lines(tool_data)
 
   local block_index = stored and (type(stored) == "table" and stored.index or stored) or nil
   local bufnr = get_message_buf()
@@ -966,6 +1288,13 @@ function M.upsert_tool_call(tool_call_id, tool_data)
     local ns = vim.api.nvim_create_namespace("cog_tool_card")
     vim.api.nvim_buf_clear_namespace(bufnr, ns, block.content_start, block.content_end + 1)
     apply_tool_card_highlights(bufnr, block.content_start, card_lines, status, kind)
+
+    -- Create fold for long output if needed
+    if fold_info and status == "completed" then
+      local fold_start = block.content_start + fold_info.fold_start
+      local fold_end = block.content_start + fold_info.fold_end
+      create_tool_fold(bufnr, fold_start, fold_end, fold_info.hidden_count)
+    end
   else
     -- Create new tool call block
     local existing = vim.api.nvim_buf_line_count(bufnr)
@@ -991,6 +1320,13 @@ function M.upsert_tool_call(tool_call_id, tool_data)
 
     -- Apply highlights
     apply_tool_card_highlights(bufnr, content_start, card_lines, status, kind)
+
+    -- Create fold for long output if needed
+    if fold_info and status == "completed" then
+      local fold_start = content_start + fold_info.fold_start
+      local fold_end = content_start + fold_info.fold_end
+      create_tool_fold(bufnr, fold_start, fold_end, fold_info.hidden_count)
+    end
 
     -- Track message block (no header for tool cards)
     table.insert(state.message_blocks, {
@@ -1198,6 +1534,10 @@ function M.reset()
   state.last_line = nil
   state.message_blocks = {}
   state.tool_calls = {}
+  state.current_message_tokens = 0
+
+  -- Clear fold ranges
+  fold_ranges = {}
 
   M.end_stream()
 
@@ -1220,6 +1560,33 @@ function M.reset()
     -- Clear tool card highlights
     local tool_ns = vim.api.nvim_create_namespace("cog_tool_card")
     vim.api.nvim_buf_clear_namespace(bufnr, tool_ns, 0, -1)
+    -- Clear token count
+    local token_ns = vim.api.nvim_create_namespace("cog_token_count")
+    vim.api.nvim_buf_clear_namespace(bufnr, token_ns, 0, -1)
+    -- Clear thinking highlights
+    local thinking_ns = vim.api.nvim_create_namespace("cog_thinking")
+    vim.api.nvim_buf_clear_namespace(bufnr, thinking_ns, 0, -1)
+    -- Clear all folds
+    pcall(vim.api.nvim_buf_call, bufnr, function()
+      vim.cmd("normal! zE")
+    end)
+  end
+end
+
+-- Update status indicator with tool information
+-- opts = { tool_name = "Read", tool_kind = "read", command = "ls -la" }
+function M.set_tool_status(status, opts)
+  opts = opts or {}
+  if state.layout_type ~= "popup" then
+    if status == "running" or status == "in_progress" then
+      split.set_status("tool_running", nil, opts)
+    elseif status == "completed" then
+      split.set_status("ok", "Ready")
+    elseif status == "failed" or status == "error" then
+      split.set_status("error", opts.message or "Tool failed")
+    else
+      split.set_status("pending", nil, opts)
+    end
   end
 end
 

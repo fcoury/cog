@@ -1,6 +1,7 @@
 local M = {}
 
 local config = require("cog.config")
+local icons = require("cog.ui.icons")
 
 local state = {
   chat_win = nil,
@@ -13,6 +14,13 @@ local state = {
     title = "New Chat",
     tokens = 0,
     model = "",
+  },
+  -- Spinner animation state
+  spinner = {
+    timer = nil,
+    frame = 1,
+    active = false,
+    message = "",
   },
 }
 
@@ -327,17 +335,6 @@ function M.focus_input()
   end
 end
 
-function M.close()
-  if state.input_win and vim.api.nvim_win_is_valid(state.input_win) then
-    vim.api.nvim_win_close(state.input_win, false)
-  end
-  if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
-    vim.api.nvim_win_close(state.chat_win, false)
-  end
-  state.chat_win = nil
-  state.input_win = nil
-end
-
 function M.get_chat_buf()
   return state.chat_buf
 end
@@ -367,9 +364,21 @@ function M.restore_focus()
   end
 end
 
--- Update status indicator (called during operations)
-function M.set_status(status, message)
+-- Stop spinner animation
+local function stop_spinner()
+  if state.spinner.timer then
+    state.spinner.timer:stop()
+    state.spinner.timer:close()
+    state.spinner.timer = nil
+  end
+  state.spinner.active = false
+  state.spinner.frame = 1
+end
+
+-- Update the status line with current spinner frame
+local function update_statusline_with_spinner()
   if not state.input_win or not vim.api.nvim_win_is_valid(state.input_win) then
+    stop_spinner()
     return
   end
 
@@ -383,22 +392,120 @@ function M.set_status(status, message)
     cwd = "..." .. cwd:sub(-27)
   end
 
+  local status_icon = icons.spinner_frames[state.spinner.frame] or "◐"
+  local statusline = "%#CogFooter# " .. cwd .. " %=%#CogStatusPending#" .. status_icon .. "%* " .. state.spinner.message .. " "
+  pcall(vim.api.nvim_win_set_option, state.input_win, "statusline", statusline)
+end
+
+-- Start spinner animation
+local function start_spinner(message)
+  stop_spinner() -- Clean up any existing timer
+
+  state.spinner.active = true
+  state.spinner.message = message or "Thinking..."
+  state.spinner.frame = 1
+
+  -- Initial update
+  update_statusline_with_spinner()
+
+  -- Start animation timer (100ms interval)
+  local timer = vim.loop.new_timer()
+  state.spinner.timer = timer
+  timer:start(100, 100, vim.schedule_wrap(function()
+    if not state.spinner.active then
+      stop_spinner()
+      return
+    end
+    state.spinner.frame = (state.spinner.frame % #icons.spinner_frames) + 1
+    update_statusline_with_spinner()
+  end))
+end
+
+-- Update spinner message without restarting animation
+local function update_spinner_message(message)
+  if state.spinner.active then
+    state.spinner.message = message or state.spinner.message
+    update_statusline_with_spinner()
+  end
+end
+
+-- Update status indicator (called during operations)
+-- opts = { tool_name = "Read", tool_kind = "read" } for enhanced status
+function M.set_status(status, message, opts)
+  opts = opts or {}
+
+  if not state.input_win or not vim.api.nvim_win_is_valid(state.input_win) then
+    stop_spinner()
+    return
+  end
+
+  local cfg = config.get().ui.chat or {}
+  if cfg.show_footer == false then
+    stop_spinner()
+    return
+  end
+
+  -- Build context-aware status message
+  local status_message = message
+  if status == "pending" or status == "tool_running" then
+    if opts.tool_name then
+      status_message = "Calling " .. opts.tool_name .. "..."
+    elseif opts.command then
+      -- Truncate long commands
+      local cmd = opts.command
+      if #cmd > 30 then
+        cmd = cmd:sub(1, 27) .. "..."
+      end
+      status_message = "Running: " .. cmd
+    else
+      status_message = message or "Thinking..."
+    end
+  end
+
+  -- Handle animated pending/tool_running state
+  if status == "pending" or status == "tool_running" then
+    if state.spinner.active then
+      -- Update message without restarting animation
+      update_spinner_message(status_message)
+    else
+      start_spinner(status_message)
+    end
+    return
+  end
+
+  -- Stop animation for non-pending states
+  stop_spinner()
+
+  local cwd = vim.fn.fnamemodify(vim.fn.getcwd(), ":~")
+  if #cwd > 30 then
+    cwd = "..." .. cwd:sub(-27)
+  end
+
   local status_hl = "CogStatusOk"
   local status_icon = "●"
-  local status_text = message or "Ready"
+  local status_text = status_message or "Ready"
 
-  if status == "pending" then
-    status_hl = "CogStatusPending"
-    status_icon = "◐"
-    status_text = message or "Thinking..."
-  elseif status == "error" then
+  if status == "error" then
     status_hl = "CogStatusError"
     status_icon = "●"
-    status_text = message or "Error"
+    status_text = status_message or "Error"
   end
 
   local statusline = "%#CogFooter# " .. cwd .. " %=%#" .. status_hl .. "#" .. status_icon .. "%* " .. status_text .. " "
   pcall(vim.api.nvim_win_set_option, state.input_win, "statusline", statusline)
+end
+
+-- Clean up spinner on close
+function M.close()
+  stop_spinner()
+  if state.input_win and vim.api.nvim_win_is_valid(state.input_win) then
+    vim.api.nvim_win_close(state.input_win, false)
+  end
+  if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
+    vim.api.nvim_win_close(state.chat_win, false)
+  end
+  state.chat_win = nil
+  state.input_win = nil
 end
 
 return M

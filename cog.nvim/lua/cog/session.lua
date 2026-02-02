@@ -564,7 +564,11 @@ function M.handle_event(event, payload)
 
     if update_type == "agent_message" then
       ui.chat.append_stream_chunk("assistant", text, "message")
-      ui.chat.end_stream("assistant")
+      -- Extract token count if available
+      local tokens = update.usage and (update.usage.output_tokens or update.usage.outputTokens)
+        or update.outputTokens or update.output_tokens
+        or (payload.usage and (payload.usage.output_tokens or payload.usage.outputTokens))
+      ui.chat.end_stream(tokens)
       return
     end
 
@@ -589,6 +593,29 @@ function M.handle_event(event, payload)
       elseif status == "completed" or status == "failed" then
         ui.progress.finish(title .. " " .. status)
       end
+
+      -- Extract tool kind for status indicator
+      local kind_for_status = (tool_call and tool_call.kind) or update.kind or payload.kind
+      if type(kind_for_status) == "string" then
+        kind_for_status = kind_for_status:sub(1, 1):upper() .. kind_for_status:sub(2):lower()
+      end
+
+      -- Update status indicator with tool information
+      local status_opts = {
+        tool_name = kind_for_status or title,
+        tool_kind = (tool_call and tool_call.kind) or update.kind or payload.kind,
+      }
+      -- Extract command for bash tools
+      local raw_input_for_status = (tool_call and (tool_call.rawInput or tool_call.raw_input))
+        or update.rawInput or update.raw_input
+      if raw_input_for_status and raw_input_for_status.command then
+        if type(raw_input_for_status.command) == "table" then
+          status_opts.command = raw_input_for_status.command[#raw_input_for_status.command]
+        else
+          status_opts.command = tostring(raw_input_for_status.command)
+        end
+      end
+      ui.chat.set_tool_status(status or "in_progress", status_opts)
       local tool_call_id = (tool_call and (tool_call.toolCallId or tool_call.tool_call_id or tool_call.id))
         or update.toolCallId
         or update.tool_call_id
@@ -696,8 +723,19 @@ function M.handle_event(event, payload)
       or update_type == "current_mode_update"
       or update_type == "config_option_update"
     then
-      ui.chat.end_stream("assistant")
+      ui.chat.end_stream()
       ui.chat.append("system", text)
+      return
+    end
+
+    -- Handle usage/token updates
+    if update_type == "usage" or update_type == "usage_update" then
+      local usage = update.usage or payload.usage or update
+      local total_tokens = usage.total_tokens or usage.totalTokens
+        or ((usage.input_tokens or usage.inputTokens or 0) + (usage.output_tokens or usage.outputTokens or 0))
+      if total_tokens and total_tokens > 0 then
+        require("cog.ui.split").set_session_info({ tokens = total_tokens })
+      end
       return
     end
 

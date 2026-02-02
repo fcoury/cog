@@ -22,6 +22,10 @@ M.tool_icons = {
   Glob = "",
   find = "",
   Find = "",
+  search = "",         -- nf-fa-search
+  Search = "",
+  ls = "",            -- nf-fa-folder_open_o
+  LS = "",
 
   -- Terminal/execution
   bash = "",           -- nf-fa-terminal
