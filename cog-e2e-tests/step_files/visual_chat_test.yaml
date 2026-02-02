@@ -1,0 +1,51 @@
+session:
+  command: nvim
+  args: ["-u", "NONE", "--cmd", "set rtp+=/Volumes/External/code-external/cog/cog.nvim", "-c", "luafile /Volumes/External/code-external/cog/cog-e2e-tests/nvim_test_config/visual_test_init.lua"]
+  cols: 140
+  rows: 50
+
+steps:
+  # Wait for neovim to start and test data to load
+  # Note: No idle wait because animated spinner keeps screen updating
+  - waitForPattern: {pattern: "Visual test data loaded", timeoutMs: 20000}
+
+  # Focus the chat window using lua
+  - type: {text: ":lua require('cog.ui.split').focus_chat()"}
+  - press: {key: "Enter"}
+  # Wait for a known UI element to appear instead of idle
+  - waitForPattern: {pattern: "You", timeoutMs: 5000}
+
+  # Go to top of buffer
+  - type: {text: "gg"}
+
+  # Screenshot 1: Full chat at top (initial view)
+  - screenshot: {name: "01_full_chat_top"}
+
+  # Scroll down to see middle content (use j key multiple times)
+  - type: {text: "30j"}
+  - screenshot: {name: "02_scrolled_messages"}
+
+  # Scroll down to see tool cards
+  - type: {text: "30j"}
+  - screenshot: {name: "03_tool_cards_section"}
+
+  # Scroll down more to see more tools
+  - type: {text: "30j"}
+  - screenshot: {name: "04_more_tools"}
+
+  # Go to end of buffer to see pending state
+  - type: {text: "G"}
+  - screenshot: {name: "05_end_with_pending"}
+
+  # Go back to top for final overview
+  - type: {text: "gg"}
+  - screenshot: {name: "06_back_to_top"}
+
+  # Exit cleanly
+  - press: {key: "Escape"}
+  - type: {text: ":qa!"}
+  - press: {key: "Enter"}
+
+artifacts:
+  mode: always
+  dir: /Volumes/External/code-external/cog/cog-e2e-tests/test_artifacts/visual_evaluation
